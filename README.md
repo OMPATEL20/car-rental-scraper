@@ -1,4 +1,4 @@
-# Car Rental Scraper — Easy Setup Guide
+# Car Rental Scraper —  Setup Guide
 
 This tool collects car prices from **Sixt** and **Enterprise** websites and saves them to an **Excel-friendly CSV file**.
 
