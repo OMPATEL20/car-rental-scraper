@@ -1,0 +1,4 @@
+pandas>=2.2.0
+playwright>=1.49.0
+pyyaml>=6.0.1
+requests>=2.31.0
