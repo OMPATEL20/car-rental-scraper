@@ -205,15 +205,18 @@ _SIXT_METADATA_JS = r"""
     if (v) out[k] = v;
   }
 
-  for (const [k, key] of Object.entries({
-    pickup_storage: 'rent-search_historyPickup',
-    return_storage: 'rent-search_historyReturn',
-  })) {
-    try {
-      const arr = JSON.parse(localStorage.getItem(key) || '[]');
-      if (arr && arr[0] && arr[0].date) out[k] = arr[0].date;
-    } catch (e) {}
-  }
+  try {
+    const p = JSON.parse(localStorage.getItem('rent-search_historyPickup') || '[]');
+    if (p && p[0]) {
+      if (p[0].date && !out.pickup_storage) out.pickup_storage = p[0].date;
+      if (p[0].time && !out.pickup_time_storage) out.pickup_time_storage = p[0].time;
+    }
+    const r = JSON.parse(localStorage.getItem('rent-search_historyReturn') || '[]');
+    if (r && r[0]) {
+      if (r[0].date && !out.return_storage) out.return_storage = r[0].date;
+      if (r[0].time && !out.return_time_storage) out.return_time_storage = r[0].time;
+    }
+  } catch (e) {}
 
   const html = document.documentElement.innerHTML;
   for (const key of ['pickupDate','returnDate','pickup_date','return_date','pickUpDate']) {
@@ -253,6 +256,8 @@ def _normalize_sixt_metadata(raw: dict) -> dict:
         ("return_storage", "return_date", "return_time"),
         ("pickup_time_display", None, "pickup_time"),
         ("return_time_display", None, "return_time"),
+        ("pickup_time_storage", None, "pickup_time"),
+        ("return_time_storage", None, "return_time"),
     ]
     for src_key, date_key, time_key in field_map:
         val = raw.get(src_key)
@@ -891,10 +896,100 @@ def _parse_seats_bags_from_lines(lines: list[str]) -> tuple:
     return seats, bags
 
 
+_SIXT_TYPE_SET = {t.upper() for t in CAR_TYPES}
+_SIXT_MODEL_LINE_RE = re.compile(r"^[A-Z0-9][A-Z0-9 \-]{2,45}$")
+
+
+def _sixt_type_rank(type_up: str) -> int:
+    """Prefer SUV/Premium over generic 'Standard' when both match a model line."""
+    if type_up in ("SUV", "MINIVAN", "VAN", "PICKUP", "TRUCK", "CROSSOVER"):
+        return 3
+    if type_up in ("PREMIUM", "LUXURY", "FULLSIZE", "FULL-SIZE", "INTERMEDIATE", "COMPACT"):
+        return 2
+    if type_up == "STANDARD":
+        return 1
+    return 2
+
+
+def _resolve_sixt_car_header(window: list[str]) -> tuple[str, str, list[str]]:
+    """Return (car_name, car_type, header_slice) from lines above a Sixt price."""
+    car_name, car_type = "Unknown", "Unknown"
+    header_slice = window
+
+    for j, w in enumerate(window):
+        hm = SIXT_CLASS_LINE_RE.match(w)
+        if hm:
+            base_type = hm.group(1).replace("-", "").title()
+            if base_type.lower() == "fullsize":
+                base_type = "Fullsize"
+            car_type = f"{base_type} Elite" if hm.group(2) else base_type
+            car_name = hm.group(3).strip()
+            return car_name, car_type, window[j:]
+
+    # Sixt.ca often lists class and model on separate lines (e.g. SUV / GMC ACADIA).
+    best_split = None
+    for j, w in enumerate(window):
+        w_st = w.strip()
+        w_up = w_st.upper()
+        if w_up not in _SIXT_TYPE_SET:
+            continue
+        if w_up == "STANDARD" and j > 0 and window[j - 1].strip().lower() in (
+            "select", "filter", "sort", "recommended",
+        ):
+            continue
+        type_label = "Fullsize" if w_up.replace("-", "") == "FULLSIZE" else w_st.title()
+        for k in range(j + 1, min(j + 5, len(window))):
+            nxt = window[k].strip()
+            if not nxt or nxt.lower() in ("automatic", "manual"):
+                continue
+            if PRICE_RE.search(nxt):
+                break
+            if _SIXT_MODEL_LINE_RE.match(nxt) and len(nxt.split()) >= 2:
+                if nxt.upper() not in _SIXT_TYPE_SET and nxt not in FALSE_POS:
+                    rank = _sixt_type_rank(w_up)
+                    if best_split is None or (k, rank) > (best_split[0], best_split[1]):
+                        best_split = (k, rank, nxt, type_label, window[j:])
+    if best_split:
+        _, _, car_name, car_type, header_slice = best_split
+        return car_name, car_type, header_slice
+
+    for w in reversed(window):
+        w_st = w.strip()
+        if w_st in FALSE_POS or w_st.lower() in ("automatic", "manual", "unlimited"):
+            continue
+        if PRICE_RE.search(w_st):
+            continue
+        if _SIXT_MODEL_LINE_RE.match(w_st) and len(w_st.split()) >= 2:
+            if w_st.upper() not in _SIXT_TYPE_SET:
+                car_name = w_st
+                break
+        pm = MODEL_PAREN_RE.search(w_st)
+        if pm and car_name == "Unknown":
+            candidate = pm.group(1).strip()
+            if candidate.lower() not in {"or similar", "awd", "4wd", "4x4"}:
+                car_name = candidate
+        if car_name == "Unknown" and TITLE_NAME_RE.match(w_st) and len(w_st.split()) >= 2:
+            car_name = w_st
+
+    if car_type == "Unknown":
+        for w in reversed(window):
+            tm = TYPE_RE.search(w)
+            if tm:
+                car_type = tm.group(1).title()
+                break
+            w_up = w.strip().upper()
+            if w_up in _SIXT_TYPE_SET:
+                car_type = "Fullsize" if w_up.replace("-", "") == "FULLSIZE" else w.strip().title()
+                break
+
+    return car_name, car_type, header_slice
+
+
 def _extract_sixt_cards(page_text: str, location: str) -> list[dict]:
     """Deterministic Sixt offer parser — no AI."""
     lines = [l.strip() for l in page_text.split("\n") if l.strip()]
     cars = []
+    last_price_idx = -1
     for i, line in enumerate(lines):
         price_m = PRICE_RE.search(line)
         if not price_m:
@@ -910,21 +1005,10 @@ def _extract_sixt_cards(page_text: str, location: str) -> list[dict]:
         if not (10.0 <= val <= 5000.0):
             continue
 
-        window = lines[max(0, i - 35):i]
-        car_name, car_type, transmission = "Unknown", "Unknown", "Automatic"
-        seats, bags = None, None
-
-        header_slice = window
-        for j, w in enumerate(window):
-            hm = SIXT_CLASS_LINE_RE.match(w)
-            if hm:
-                base_type = hm.group(1).replace("-", "").title()
-                if base_type.lower() == "fullsize":
-                    base_type = "Fullsize"
-                car_type = f"{base_type} Elite" if hm.group(2) else base_type
-                car_name = hm.group(3).strip()
-                header_slice = window[j:]
-
+        window = lines[last_price_idx + 1:i]
+        last_price_idx = i
+        car_name, car_type, header_slice = _resolve_sixt_car_header(window)
+        transmission = "Automatic"
         seats, bags = _parse_seats_bags_from_lines(header_slice)
         for w in reversed(window):
             if re.search(r"\b(automatic|manual)\b", w, re.I):
@@ -1024,8 +1108,6 @@ def _extract_dom_sixt(page: Page, location: str) -> list[dict]:
                     const t = (el.innerText || '').trim();
                     if (!t || t.length < 40 || t.length > 2500) continue;
                     if (!/CA\\$[\\d,.]+\\s*\\/\\s*day/i.test(t)) continue;
-                    if (!/\\((?:AUDI|BMW|TOYOTA|MAZDA|JEEP|MINI|FORD|KIA|HYUNDAI|CHRYSLER)/i.test(t)
-                        && !/\\([A-Z][A-Z0-9\\s\\-]+\\)/.test(t)) continue;
                     const key = t.slice(0, 120);
                     if (seen.has(key)) continue;
                     seen.add(key);
@@ -1343,6 +1425,205 @@ def _norm_price_key(price) -> str:
     return re.sub(r"[^\d.]", "", str(price or "")).strip(".")
 
 
+def _merge_sixt_by_price(*sources) -> list[dict]:
+    """Merge by price: earlier sources win; later sources fill empty fields only."""
+    by_price: dict[str, dict] = {}
+    for source in sources:
+        for c in source:
+            pk = _norm_price_key(c.get("price_per_day", ""))
+            if not pk:
+                continue
+            if pk not in by_price:
+                by_price[pk] = dict(c)
+            else:
+                base = by_price[pk]
+                for field in ("seats", "bags", "transmission", "car_type", "car_name"):
+                    if base.get(field) in (None, "", "Unknown") and c.get(field) not in (None, "", "Unknown"):
+                        base[field] = c[field]
+    return list(by_price.values())
+
+
+def _backfill_from_parser(ai_cars: list[dict], parser_cars: list[dict]) -> list[dict]:
+    """Keep AI row count; fill empty fields from parser matched by price."""
+    if not ai_cars:
+        return parser_cars
+    if not parser_cars:
+        return ai_cars
+    by_price = {
+        _norm_price_key(c.get("price_per_day", "")): c
+        for c in parser_cars
+        if _norm_price_key(c.get("price_per_day", ""))
+    }
+    for car in ai_cars:
+        parser = by_price.get(_norm_price_key(car.get("price_per_day", "")))
+        if not parser:
+            continue
+        for field in ("seats", "bags", "transmission", "car_type", "car_name"):
+            if car.get(field) in (None, "", "Unknown") and parser.get(field) not in (None, "", "Unknown"):
+                car[field] = parser[field]
+    return ai_cars
+
+
+def _sixt_text_for_ollama(page_text: str) -> str:
+    """Compact card-focused text so Ollama sees every offer, not page chrome."""
+    lines = [l.strip() for l in page_text.split("\n") if l.strip()]
+    chunks, seen_prices = [], set()
+    for i, line in enumerate(lines):
+        if not re.search(r"CA\$[\d,.]+/day", line, re.I):
+            continue
+        pk = re.sub(r"[^\d.]", "", line)
+        if pk in seen_prices:
+            continue
+        seen_prices.add(pk)
+        chunks.append("\n".join(lines[max(0, i - 10): i + 1]))
+    if chunks:
+        return "\n---\n".join(chunks)
+    return page_text[:30000]
+
+
+def _ollama_extract_prompts(location: str, site_hint: str, page_text: str) -> tuple[str, str]:
+    """Site-specific strict prompts for Ollama extraction."""
+    hint = (site_hint or "").lower()
+    is_sixt = "sixt" in hint
+    is_enterprise = "enterprise" in hint
+    text_for_ai = _sixt_text_for_ollama(page_text) if is_sixt else page_text[:30000]
+
+    system = (
+        "You are a STRICT car-rental JSON extraction engine.\n"
+        "GLOBAL RULES:\n"
+        "- ONLY extract vehicles that clearly exist in the page text\n"
+        "- NEVER guess, infer, or hallucinate cars or prices\n"
+        "- price_per_day MUST be CA$XX.XX/day (include CA$ and /day)\n"
+        "- SKIP 'Call For Availability' rows without a visible per-day price\n"
+        "- Output ONLY a valid JSON array — no markdown, no commentary\n"
+    )
+
+    if is_sixt:
+        system += (
+            "\nSIXT.CA — extract EVERY offer that has CA$/day (typically 10–15 cars).\n"
+            "Each card block looks like:\n"
+            "  1) CLASS line (e.g. STANDARD SUV, COMPACT SEDAN, Premium, STANDARD SUV)\n"
+            "  2) MODEL line in ALL CAPS (e.g. GMC ACADIA, VOLKSWAGEN JETTA)\n"
+            "  3) Or similar model (ignore this line)\n"
+            "  4) two numbers = seats and bags (e.g. 7 then 4, or 5 then 3)\n"
+            "  5) Automatic or Manual\n"
+            "  6) CA$61.91/day (use this exact price line, ignore CA$XXX.XXtotal lines)\n"
+            "\nSIXT FIELD RULES:\n"
+            "- car_name: ALL-CAPS model line only (GMC ACADIA, BMW 3 SERIES)\n"
+            "- car_type: the class line above the model — use as shown (Standard Suv, Compact Sedan, Premium)\n"
+            "- transmission: Automatic or Manual from the card; null only if truly absent\n"
+            "- seats/bags: from the two numbers before Automatic; null only if truly absent\n"
+            "- DO NOT skip a car just because seats/bags are unclear — include name + price\n"
+            "- Ignore filters, sidebar, member-rate promos, and 'total' prices\n"
+            "- One JSON object per unique CA$/day price\n"
+        )
+        example = (
+            '"car_name": "GMC ACADIA",\n'
+            '    "car_type": "Standard Suv",\n'
+            '    "price_per_day": "CA$74.38/day",\n'
+            '    "transmission": "Automatic",\n'
+            '    "seats": 7,\n'
+            '    "bags": 4'
+        )
+    elif is_enterprise:
+        system += (
+            "- transmission MUST be 'Automatic' or 'Manual' when shown — null if not visible\n"
+            "- seats and bags MUST be integers when 'X People' / 'X Bags' are shown\n"
+            "- If a required field is missing on a card → SKIP that vehicle\n"
+        )
+        system += (
+            "\nENTERPRISE.COM — each offer card contains:\n"
+            "  1) vehicle class line (e.g. Compact SUV, Midsize, Premium)\n"
+            "  2) model line ending in 'or similar' (e.g. Nissan Kicks or similar)\n"
+            "  3) Automatic\n"
+            "  4) X People, X Bags\n"
+            "  5) $XX.XX then 'Per Day'\n"
+            "\nENTERPRISE FIELD RULES:\n"
+            "- car_name: model line with 'or similar' suffix\n"
+            "- car_type: vehicle class line above the model\n"
+            "- price_per_day: convert $XX.XX Per Day to CA$XX.XX/day\n"
+            "- transmission: almost always Automatic\n"
+            "- seats/bags: from 'X People' and 'X Bags' lines\n"
+            "- Skip 'Explore Alternative' / hidden vehicles section\n"
+        )
+        example = (
+            '"car_name": "Nissan Kicks or similar",\n'
+            '    "car_type": "Compact SUV",\n'
+            '    "price_per_day": "CA$78.84/day",\n'
+            '    "transmission": "Automatic",\n'
+            '    "seats": 5,\n'
+            '    "bags": 3'
+        )
+    else:
+        example = (
+            '"car_name": "...",\n'
+            '    "car_type": "...",\n'
+            '    "price_per_day": "CA$00.00/day",\n'
+            '    "transmission": "Automatic",\n'
+            '    "seats": 5,\n'
+            '    "bags": 3'
+        )
+
+    user = f"""Extract every rental offer from this page.
+
+Location: {location}
+Site: {site_hint}
+
+Every object MUST include transmission, seats, and bags when they appear on the card.
+Return JSON array:
+[
+  {{
+    {example},
+    "location": "{location}"
+  }}
+]
+
+PAGE TEXT:
+{text_for_ai}
+"""
+    return system, user
+
+
+def _ollama_strict_extract(page_text, location, site_hint=""):
+    system, user = _ollama_extract_prompts(location, site_hint, page_text)
+
+    try:
+        raw = _ollama_chat([
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ])
+
+        cars = _parse_json_array(raw)
+        for c in cars:
+            c["_source"] = "ollama"
+            if not c.get("location"):
+                c["location"] = location
+            if c.get("price_per_day"):
+                c["price_per_day"] = _normalise_price(str(c["price_per_day"]))
+            if c.get("transmission"):
+                c["transmission"] = str(c["transmission"]).title()
+            for field in ("seats", "bags"):
+                if c.get(field) is not None:
+                    try:
+                        c[field] = int(float(c[field]))
+                    except (TypeError, ValueError):
+                        c[field] = None
+
+        logger.info(f"  [ollama_strict] {len(cars)} cars")
+        return cars
+
+    except Exception as e:
+        logger.warning(f"ollama strict failed: {e}")
+        return []
+
+
+def _ollama_script_prompt_src() -> str:
+    """Embed the same Ollama prompt helpers used by run.py into generated scripts."""
+    import inspect
+    src = inspect.getsource(_ollama_extract_prompts) + "\n" + inspect.getsource(_ollama_strict_extract)
+    return src.replace("logger.info(", "log(").replace("logger.warning(", "log(")
+
+
 def _merge_results(*sources):
     by_key: dict[tuple, dict] = {}
     for source in sources:
@@ -1373,60 +1654,1042 @@ def _merge_results(*sources):
     logger.info(f"  [merge] {len(merged)} unique cars")
     return merged
 
-def _ollama_strict_extract(page_text, location, site_hint=""):
+_OLLAMA_SCRIPT_HEAD = r'''
+# ── Ollama AI (same high-precision prompts as run.py) ────────────────────────
+# Set USE_OLLAMA=0 to disable. AI_MODE: hybrid (default) | merge | first | off
+# Requires: ollama serve  &&  ollama pull qwen2.5:7b
+
+
+def _normalise_price(raw):
+    p = re.sub(r"\s*/\s*", "/", re.sub(r"\s+", "", str(raw)))
+    if not p.upper().startswith("CA"):
+        p = "CA" + p
+    return p
+
+
+def _ollama_available():
+    if not USE_OLLAMA or AI_MODE == "off":
+        return False
+    try:
+        requests.get(f"{OLLAMA_BASE}/api/tags", timeout=4).raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def _ollama_chat(messages, model=None, temperature=0.0, max_tokens=8192):
+    model = model or EXTRACTOR_MODEL
+    payload = {
+        "model": model, "stream": False,
+        "options": {"temperature": temperature, "num_predict": max_tokens},
+        "messages": messages,
+    }
+    resp = requests.post(f"{OLLAMA_BASE}/api/chat", json=payload, timeout=300)
+    resp.raise_for_status()
+    return resp.json()["message"]["content"].strip()
+
+
+def _parse_json_array(raw):
+    raw = re.sub(r"```(?:json)?", "", raw).strip().strip("`")
+    start, end = raw.find("["), raw.rfind("]")
+    if start != -1 and end != -1:
+        try:
+            return json.loads(raw[start:end + 1])
+        except Exception:
+            pass
+    return []
+
+
+'''
+_OLLAMA_SCRIPT_TAIL = r'''
+def _ollama_enrich(cars, page_text, location, site_hint=""):
+    """Fill Unknown car_name/car_type only — never overwrite good parser values."""
+    needs = [c for c in cars
+             if c.get("car_name") in (None, "", "Unknown")
+             or c.get("car_type") in (None, "", "Unknown")]
+    if not needs:
+        return cars
     system = (
-        "You are a STRICT extraction engine.\n"
-        "Rules:\n"
-        "- ONLY extract cars that clearly exist in text\n"
-        "- NEVER guess or hallucinate\n"
-        "- price_per_day MUST include currency and '/day'\n"
-        "- For Enterprise, car_name is the model line ending in 'or similar' (example: 'Nissan Kicks or similar')\n"
-        "- For Enterprise, car_type is the vehicle class line above the model (example: 'Compact SUV')\n"
-        "- SKIP vehicles that say 'Call For Availability' and do not have a visible 'Per Day' price\n"
-        "- If unsure → SKIP\n"
-        "- Output ONLY JSON array\n"
+        "You are a car-rental data enrichment engine.\n"
+        "ONLY fill car_name and car_type where the value is 'Unknown' or missing.\n"
+        "NEVER change price_per_day, transmission, seats, bags, or location.\n"
+        "NEVER invent new vehicles. Match each record to the page text by price.\n"
+        "Output ONLY a JSON array with EXACTLY the same number of records, same order."
     )
-
-    user = f"""
-Extract car rentals from {site_hint}.
-
-Return JSON:
-[
-  {{
-    "car_name": "...",
-    "car_type": "...",
-    "price_per_day": "CA$00.00/day",
-    "transmission": "...",
-    "seats": number or null,
-    "bags": number or null,
-    "location": "{location}"
-  }}
-]
-
-TEXT:
-{page_text[:20000]}
-"""
-
+    user = (
+        f"Site: {site_hint or location}\n\n"
+        f"Records to enrich:\n{json.dumps(needs, indent=2)}\n\n"
+        f"Page text:\n{page_text[:18000]}\n\n"
+        f"Return EXACTLY {len(needs)} records in the SAME ORDER."
+    )
     try:
         raw = _ollama_chat([
-            {"role":"system","content":system},
-            {"role":"user","content":user}
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ])
+        enriched = _parse_json_array(raw)
+        if len(enriched) != len(needs):
+            log(f"  [ollama] enrich count mismatch ({len(enriched)} vs {len(needs)})")
+            return cars
+        for orig, enr in zip(needs, enriched):
+            if orig.get("car_name") in (None, "", "Unknown") and enr.get("car_name"):
+                orig["car_name"] = enr["car_name"]
+            if orig.get("car_type") in (None, "", "Unknown") and enr.get("car_type"):
+                orig["car_type"] = enr["car_type"]
+        log(f"  [ollama] enriched {len(enriched)} fields")
+    except Exception as e:
+        log(f"  [ollama] enrich failed: {e}")
+    return cars
 
-        cars = _parse_json_array(raw)
-        for c in cars:
-            c["_source"] = "ollama"
-            if not c.get("location"):
-                c["location"] = location
-            if c.get("price_per_day"):
-                c["price_per_day"] = _normalise_price(str(c["price_per_day"]))
 
-        logger.info(f"  [ollama_strict] {len(cars)} cars")
+def _merge_cars_by_price(*sources):
+    """One record per price; first source wins, fill missing fields from later."""
+    by_price = {}
+    for source in sources:
+        for c in source:
+            pk = re.sub(r"[^\d.]", "", str(c.get("price_per_day", ""))).strip(".")
+            if not pk:
+                continue
+            if pk not in by_price:
+                by_price[pk] = dict(c)
+            else:
+                base = by_price[pk]
+                for field in ("seats", "bags", "transmission", "car_type", "car_name"):
+                    if base.get(field) in (None, "", "Unknown") and c.get(field) not in (None, "", "Unknown"):
+                        base[field] = c[field]
+    return list(by_price.values())
+
+
+def _finalize_cars_with_ollama(cars, page_text, site_hint):
+    """Apply Ollama using the same hybrid/merge/first modes as run.py."""
+    if not _ollama_available():
+        if USE_OLLAMA and AI_MODE != "off":
+            log("  Ollama not reachable — using parser results only (run: ollama serve)")
         return cars
 
+    if AI_MODE == "first":
+        log("  AI-first mode: reading all offers with Ollama...")
+        ai_cars = _ollama_strict_extract(page_text, LOCATION, site_hint)
+        parser_cars = cars
+        if ai_cars and parser_cars:
+            log("  Backfilling transmission/seats/bags from parser...")
+            by_price = {
+                re.sub(r"[^\d.]", "", str(c.get("price_per_day", ""))).strip("."): c
+                for c in parser_cars
+                if re.sub(r"[^\d.]", "", str(c.get("price_per_day", ""))).strip(".")
+            }
+            for car in ai_cars:
+                pk = re.sub(r"[^\d.]", "", str(car.get("price_per_day", ""))).strip(".")
+                parser = by_price.get(pk)
+                if not parser:
+                    continue
+                for field in ("seats", "bags", "transmission", "car_type", "car_name"):
+                    if car.get(field) in (None, "", "Unknown") and parser.get(field) not in (None, "", "Unknown"):
+                        car[field] = parser[field]
+            if len(ai_cars) < len(parser_cars):
+                log(f"  Ollama found {len(ai_cars)}/{len(parser_cars)} — adding parser offers AI missed")
+                ai_cars = _merge_cars_by_price(ai_cars, parser_cars)
+        return ai_cars or parser_cars
+
+    ai_cars = []
+    if AI_MODE == "merge":
+        log("  AI-merge mode: Ollama + parser...")
+        ai_cars = _ollama_strict_extract(page_text, LOCATION, site_hint)
+
+    if not cars:
+        log("  Parser found nothing — asking Ollama to read the page...")
+        ai_cars = ai_cars or _ollama_strict_extract(page_text, LOCATION, site_hint)
+        return ai_cars
+
+    if ai_cars:
+        cars = _merge_cars_by_price(cars, ai_cars)
+    elif any(c.get("car_name") in (None, "", "Unknown") for c in cars):
+        log("  Some names missing — asking Ollama...")
+        ai_cars = _ollama_strict_extract(page_text, LOCATION, site_hint)
+        if ai_cars:
+            cars = _merge_cars_by_price(cars, ai_cars)
+
+    if any(c.get("car_name") in (None, "", "Unknown") for c in cars):
+        cars = _ollama_enrich(cars, page_text, LOCATION, site_hint)
+
+    return cars
+
+'''
+
+
+def _ollama_script_src() -> str:
+    """Full Ollama block for generated scripts — prompts stay in sync with run.py."""
+    return _OLLAMA_SCRIPT_HEAD + _ollama_script_prompt_src() + _OLLAMA_SCRIPT_TAIL
+
+
+_SIXT_PARSER_SRC = r'''
+# ── extraction helpers ───────────────────────────────────────────────────────
+
+MODEL_PAREN_RE = re.compile(r"\(([^)]+)\)")
+TITLE_NAME_RE = re.compile(
+    r"^[A-Z][a-zA-Z\-]+(?:\s[A-Z][a-zA-Z0-9\-]+){1,4}(?:\s\(or similar\))?$"
+)
+FALSE_POS = {"Automatic","Manual","Standard","Select","Filter","Sort","Price",
+             "Day","Per","Choose","Search","Rated","Pick","View","All Cars",
+             "Recommended","Featured","Pay Later","Unlimited","Kilometers"}
+_SIXT_TYPE_SET = {t.upper() for t in CAR_TYPES}
+_SIXT_MODEL_LINE_RE = re.compile(r"^[A-Z0-9][A-Z0-9 \-]{2,45}$")
+
+
+def _normalise_price(raw):
+    p = re.sub(r"\s*/\s*", "/", re.sub(r"\s+", "", raw))
+    if not p.upper().startswith("CA"):
+        p = "CA" + p
+    return p
+
+
+def _parse_seats_bags(lines):
+    seats = bags = None
+    stop = len(lines)
+    for j, w in enumerate(lines):
+        if w.lower().startswith("unlimited") or PRICE_RE.search(w):
+            stop = j
+            break
+    nums = []
+    for w in lines[:stop]:
+        sm = re.match(r"^(\d+)\s*(?:\(\d+\+\d+\))?\s*$", w)
+        if sm:
+            n = int(sm.group(1))
+            if 1 <= n <= 9:
+                nums.append(n)
+    if len(nums) >= 2:
+        seats, bags = nums[-2], nums[-1]
+    elif len(nums) == 1:
+        seats = nums[0]
+    return seats, bags
+
+
+def _sixt_type_rank(type_up):
+    if type_up in ("SUV", "MINIVAN", "VAN", "PICKUP", "TRUCK", "CROSSOVER"):
+        return 3
+    if type_up in ("PREMIUM", "LUXURY", "FULLSIZE", "FULL-SIZE", "INTERMEDIATE", "COMPACT"):
+        return 2
+    if type_up == "STANDARD":
+        return 1
+    return 2
+
+
+def _resolve_sixt_car_header(window):
+    car_name, car_type = "Unknown", "Unknown"
+    header_slice = window
+    for j, w in enumerate(window):
+        hm = SIXT_CLASS_LINE_RE.match(w)
+        if hm:
+            base_type = hm.group(1).replace("-", "").title()
+            if base_type.lower() == "fullsize":
+                base_type = "Fullsize"
+            car_type = f"{base_type} Elite" if hm.group(2) else base_type
+            car_name = hm.group(3).strip()
+            return car_name, car_type, window[j:]
+    best_split = None
+    for j, w in enumerate(window):
+        w_st = w.strip()
+        w_up = w_st.upper()
+        if w_up not in _SIXT_TYPE_SET:
+            continue
+        if w_up == "STANDARD" and j > 0 and window[j - 1].strip().lower() in (
+            "select", "filter", "sort", "recommended",
+        ):
+            continue
+        type_label = "Fullsize" if w_up.replace("-", "") == "FULLSIZE" else w_st.title()
+        for k in range(j + 1, min(j + 5, len(window))):
+            nxt = window[k].strip()
+            if not nxt or nxt.lower() in ("automatic", "manual"):
+                continue
+            if PRICE_RE.search(nxt):
+                break
+            if _SIXT_MODEL_LINE_RE.match(nxt) and len(nxt.split()) >= 2:
+                if nxt.upper() not in _SIXT_TYPE_SET and nxt not in FALSE_POS:
+                    rank = _sixt_type_rank(w_up)
+                    if best_split is None or (k, rank) > (best_split[0], best_split[1]):
+                        best_split = (k, rank, nxt, type_label, window[j:])
+    if best_split:
+        _, _, car_name, car_type, header_slice = best_split
+        return car_name, car_type, header_slice
+    for w in reversed(window):
+        w_st = w.strip()
+        if w_st in FALSE_POS or w_st.lower() in ("automatic", "manual", "unlimited"):
+            continue
+        if PRICE_RE.search(w_st):
+            continue
+        if _SIXT_MODEL_LINE_RE.match(w_st) and len(w_st.split()) >= 2:
+            if w_st.upper() not in _SIXT_TYPE_SET:
+                car_name = w_st
+                break
+        pm = MODEL_PAREN_RE.search(w_st)
+        if pm and car_name == "Unknown":
+            candidate = pm.group(1).strip()
+            if candidate.lower() not in {"or similar", "awd", "4wd", "4x4"}:
+                car_name = candidate
+        if car_name == "Unknown" and TITLE_NAME_RE.match(w_st) and len(w_st.split()) >= 2:
+            car_name = w_st
+    if car_type == "Unknown":
+        for w in reversed(window):
+            tm = TYPE_RE.search(w)
+            if tm:
+                car_type = tm.group(1).title()
+                break
+            w_up = w.strip().upper()
+            if w_up in _SIXT_TYPE_SET:
+                car_type = "Fullsize" if w_up.replace("-", "") == "FULLSIZE" else w.strip().title()
+                break
+    return car_name, car_type, header_slice
+
+
+def _extract_sixt_cards(page_text):
+    lines = [l.strip() for l in page_text.split("\n") if l.strip()]
+    cars = []
+    last_price_idx = -1
+    for i, line in enumerate(lines):
+        price_m = PRICE_RE.search(line)
+        if not price_m:
+            continue
+        raw_price = _normalise_price(price_m.group(1))
+        num_m = NUM_RE.search(raw_price)
+        if not num_m:
+            continue
+        try:
+            val = float(num_m.group().replace(",", ""))
+        except ValueError:
+            continue
+        if not (10.0 <= val <= 5000.0):
+            continue
+        window = lines[last_price_idx + 1:i]
+        last_price_idx = i
+        car_name, car_type, header_slice = _resolve_sixt_car_header(window)
+        transmission = "Automatic"
+        seats, bags = _parse_seats_bags(header_slice)
+        for w in reversed(window):
+            if re.search(r"\b(automatic|manual)\b", w, re.I):
+                tr = TRANS_RE.search(w)
+                if tr:
+                    transmission = tr.group(1).title()
+                break
+        if car_name == "Unknown":
+            continue
+        cars.append({
+            "car_name": car_name, "car_type": car_type,
+            "price_per_day": raw_price, "transmission": transmission,
+            "seats": seats, "bags": bags, "location": LOCATION,
+            "_source": "sixt_parser",
+        })
+    seen, unique = set(), []
+    for c in cars:
+        key = (c["car_name"].lower(), c["price_per_day"].lower())
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    log(f"  [parser] {len(unique)} cars")
+    return unique
+
+
+def _extract_dom_sixt(page):
+    try:
+        chunks = page.evaluate(r"""
+            () => {
+                const out = [], seen = new Set();
+                const nodes = document.querySelectorAll(
+                    '[class*="offer"],[class*="vehicle"],[class*="car"],[data-testid*="offer"],article'
+                );
+                for (const el of nodes) {
+                    const t = (el.innerText || '').trim();
+                    if (!t || t.length < 40 || t.length > 2500) continue;
+                    if (!/CA\$[\d,.]+\s*\/\s*day/i.test(t)) continue;
+                    const key = t.slice(0, 120);
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    out.push(t);
+                }
+                return out;
+            }
+        """)
+        merged = []
+        for chunk in chunks or []:
+            merged.extend(_extract_sixt_cards(chunk))
+        log(f"  [dom] {len(merged)} cars")
+        return merged
     except Exception as e:
-        logger.warning(f"ollama strict failed: {e}")
+        log(f"  [dom] failed: {e}")
         return []
+
+
+def _sanity_filter(cars):
+    good = []
+    for c in cars:
+        m = NUM_RE.search(str(c.get("price_per_day", "")))
+        if not m:
+            continue
+        try:
+            val = float(m.group().replace(",", ""))
+        except ValueError:
+            continue
+        if 10.0 <= val <= 1500.0:
+            good.append(c)
+    return good
+
+
+def _norm_price_key(price):
+    return re.sub(r"[^\d.]", "", str(price or "")).strip(".")
+
+
+def _merge_sixt_by_price(*sources):
+    """One car per price; first source wins (pass DOM before page parser)."""
+    by_price = {}
+    for source in sources:
+        for c in source:
+            pk = _norm_price_key(c.get("price_per_day", ""))
+            if not pk:
+                continue
+            if pk not in by_price:
+                by_price[pk] = dict(c)
+            else:
+                base = by_price[pk]
+                for field in ("seats", "bags", "transmission", "car_type", "car_name"):
+                    if base.get(field) in (None, "", "Unknown") and c.get(field) not in (None, "", "Unknown"):
+                        base[field] = c[field]
+    return list(by_price.values())
+
+'''
+
+def _sixt_metadata_helpers_src() -> str:
+    """Python source embedded in generated Sixt scripts — mirrors run.py metadata."""
+    js = _SIXT_METADATA_JS.strip()
+    return f'''# ── rental date/time metadata (matches run.py) ─────────────────────────────
+
+def _normalize_time_str(time_str):
+    raw = str(time_str or "").strip()
+    if not raw:
+        return ""
+    raw = raw.upper().replace(".", ":")
+    m = re.match(r"(\\d{{1,2}}):(\\d{{2}})\\s*(AM|PM)?", raw, re.I)
+    if not m:
+        return raw[:5]
+    hour, minute, ampm = int(m.group(1)), m.group(2), (m.group(3) or "").upper()
+    if ampm == "PM" and hour < 12:
+        hour += 12
+    elif ampm == "AM" and hour == 12:
+        hour = 0
+    return f"{{hour:02d}}:{{minute}}"
+
+
+def _to_iso_date(date_str):
+    raw = str(date_str or "").strip()
+    if not raw:
+        raise ValueError("empty date")
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    raise ValueError(f"unrecognized date: {{date_str!r}}")
+
+
+def _parse_rental_field(val):
+    raw = str(val or "").strip()
+    if not raw:
+        return None, None
+    if "T" in raw or re.fullmatch(r"\\d{{4}}-\\d{{2}}-\\d{{2}}", raw):
+        if "T" in raw:
+            date_part, time_part = raw.split("T", 1)
+            return date_part[:10], _normalize_time_str(time_part)
+        return raw, None
+    tm = re.search(r"(\\d{{1,2}}:\\d{{2}}\\s*(?:AM|PM)?)", raw, re.I)
+    if tm:
+        date_part = raw[: tm.start()].strip(" ,|-")
+        try:
+            return _to_iso_date(date_part), _normalize_time_str(tm.group(1))
+        except ValueError:
+            return None, _normalize_time_str(tm.group(1))
+    try:
+        return _to_iso_date(raw), None
+    except ValueError:
+        return None, _normalize_time_str(raw)
+
+
+_SIXT_METADATA_JS = r"""
+{js}
+"""
+
+
+def _normalize_sixt_metadata(raw):
+    out = {{}}
+    field_map = [
+        ("pickup_date_display", "pickup_date", "pickup_time"),
+        ("pickupDate", "pickup_date", "pickup_time"),
+        ("pickup_date", "pickup_date", "pickup_time"),
+        ("url_pickup", "pickup_date", "pickup_time"),
+        ("pickup_storage", "pickup_date", "pickup_time"),
+        ("return_date_display", "return_date", "return_time"),
+        ("returnDate", "return_date", "return_time"),
+        ("return_date", "return_date", "return_time"),
+        ("url_return", "return_date", "return_time"),
+        ("return_storage", "return_date", "return_time"),
+        ("pickup_time_display", None, "pickup_time"),
+        ("return_time_display", None, "return_time"),
+        ("pickup_time_storage", None, "pickup_time"),
+        ("return_time_storage", None, "return_time"),
+    ]
+    for src_key, date_key, time_key in field_map:
+        val = (raw or {{}}).get(src_key)
+        if not val:
+            continue
+        iso, tm = _parse_rental_field(val)
+        if iso and date_key and date_key not in out:
+            out[date_key] = iso
+        if tm and time_key and time_key not in out:
+            out[time_key] = tm
+    return out
+
+
+def _read_sixt_rental_metadata(page):
+    try:
+        raw = page.evaluate(_SIXT_METADATA_JS)
+    except Exception:
+        raw = {{}}
+    return _normalize_sixt_metadata(raw or {{}})
+
+
+def _accumulate_rental_metadata(base, extra):
+    out = {{k: v for k, v in base.items() if v}}
+    for key, val in extra.items():
+        if val:
+            out[key] = val
+    return out
+
+
+def _finalize_rental_metadata(page_meta, user_meta=None, site="sixt"):
+    user_meta = user_meta or {{}}
+    out = {{k: v for k, v in page_meta.items() if v}}
+    for key, val in user_meta.items():
+        if val:
+            out[key] = val
+    if not out.get("pickup_date") or not out.get("return_date"):
+        now = now_mst()
+        if site == "sixt":
+            out.setdefault("pickup_date", (now + timedelta(days=2)).strftime("%Y-%m-%d"))
+            out.setdefault("return_date", (now + timedelta(days=5)).strftime("%Y-%m-%d"))
+        else:
+            out.setdefault("pickup_date", (now + timedelta(days=1)).strftime("%Y-%m-%d"))
+            out.setdefault("return_date", (now + timedelta(days=2)).strftime("%Y-%m-%d"))
+    return out
+
+
+def _stamp_rental_dates(cars, meta):
+    for car in cars:
+        for key in ("pickup_date", "return_date", "pickup_time", "return_time"):
+            if meta.get(key):
+                car[key] = meta[key]
+    return cars
+
+'''
+
+
+_SIXT_SCRIPT_TAIL = r'''
+
+# ── Sixt search flow (matches run_sixt — preloaded dates, no calendar) ───────
+
+_LOC_SKIP = {"airport", "international", "intl", "int", "city", "the"}
+
+_SIXT_SELECT_BEST_JS = r"""
+({query, requirePrimary}) => {
+  const q = (query || '').toLowerCase();
+  const words = q.split(/\s+/).filter(Boolean);
+  const skip = new Set(['airport', 'international', 'intl', 'int', 'city', 'the']);
+  const primary = words.find(w => !skip.has(w)) || words[0] || '';
+  const sels = '[data-testid*="suggestion"],[class*="suggestion"],[role="option"],'
+             + '[class*="result"] li,[class*="autocomplete"] li,ul[role="listbox"] li,'
+             + '[id*="downshift"] li,[id*="react-select"] [role="option"],li';
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const s = window.getComputedStyle(el);
+    return r.width > 2 && r.height > 2 && s.display !== 'none'
+        && s.visibility !== 'hidden' && s.opacity !== '0';
+  };
+  let items = Array.from(document.querySelectorAll(sels))
+    .filter(visible)
+    .filter(el => (el.innerText || '').trim().length > 2);
+  if (!items.length) return {status: 'no_items'};
+  const set = new Set(items);
+  const leaves = items.filter(el => {
+    for (const other of set) {
+      if (other !== el && el.contains(other)) return false;
+    }
+    return true;
+  });
+  const pool = leaves.length ? leaves : items;
+  let best = null, bestScore = -Infinity;
+  for (const el of pool) {
+    const raw = (el.innerText || '').trim();
+    const t = raw.toLowerCase();
+    let score = 0;
+    for (const w of words) if (t.includes(w)) score += 1;
+    if (primary && t.includes(primary)) score += 5; else if (primary) score -= 10;
+    if (/\bairport\b/.test(t)) score += 1.5;
+    if (el.getAttribute('role') === 'option') score += 2;
+    if ((el.getAttribute('data-testid') || '').toLowerCase().includes('suggestion')) score += 2;
+    score -= raw.length / 50;
+    if (score > bestScore) { bestScore = score; best = el; }
+  }
+  if (!best) return {status: 'no_match'};
+  if (requirePrimary && primary && !(best.innerText || '').toLowerCase().includes(primary)) {
+    return {status: 'no_primary'};
+  }
+  best.scrollIntoView({block: 'center', inline: 'center'});
+  const r = best.getBoundingClientRect();
+  const opts = {bubbles: true, cancelable: true, view: window,
+                clientX: r.left + r.width / 2, clientY: r.top + r.height / 2};
+  for (const type of ['pointerover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    best.dispatchEvent(new MouseEvent(type, opts));
+  }
+  return {status: 'clicked',
+          text: (best.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 100)};
+}
+"""
+
+
+def _primary_token(text):
+    words = [w for w in re.split(r"\s+", (text or "").lower()) if w]
+    return next((w for w in words if w not in _LOC_SKIP), words[0] if words else "")
+
+
+def _wait_for_sixt_search_form(page, timeout_ms=12000):
+    try:
+        page.wait_for_function("""
+            () => {
+              const read = (tid) => {
+                const root = document.querySelector(`[data-testid="${tid}"]`);
+                if (!root) return '';
+                for (const btn of root.querySelectorAll('button')) {
+                  const t = (btn.getAttribute('aria-label') || btn.innerText || '').trim();
+                  if (t && !/^(pickup|return)\\s+(date|time)$/i.test(t)) return t;
+                }
+                return '';
+              };
+              return read('rent-search-form-pickup-date-input')
+                  || read('rent-search-form-return-date-input')
+                  || localStorage.getItem('rent-search_historyPickup');
+            }
+        """, timeout=timeout_ms)
+    except Exception:
+        pass
+
+
+def _location_error_visible(page):
+    try:
+        return "please select a pickup location" in page.inner_text("body", timeout=1500).lower()
+    except Exception:
+        return False
+
+
+def _commit_location(page, location):
+    box = None
+    for sel in [
+        'input[placeholder*="Airport" i]', 'input[placeholder*="city" i]',
+        'input[placeholder*="location" i]', 'input[placeholder*="pickup" i]',
+        'input[type="search"]',
+    ]:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible(timeout=3000):
+                box = loc.first
+                break
+        except Exception:
+            continue
+    if box is None:
+        try:
+            cand = page.locator("input:visible").first
+            if cand.count() > 0 and cand.is_visible(timeout=2500):
+                box = cand
+        except Exception:
+            box = None
+    if box is None:
+        log("  Could not find the location search box.")
+        return False
+
+    primary = _primary_token(location)
+
+    def committed():
+        try:
+            body = page.inner_text("body", timeout=1200).lower()
+        except Exception:
+            body = ""
+        return "please select a pickup location" not in body
+
+    def select_best():
+        for _ in range(16):
+            try:
+                res = page.evaluate(_SIXT_SELECT_BEST_JS,
+                                    {"query": location, "requirePrimary": True})
+            except Exception:
+                res = {"status": "error"}
+            if res and res.get("status") == "clicked":
+                return res.get("text")
+            page.wait_for_timeout(250)
+        try:
+            res = page.evaluate(_SIXT_SELECT_BEST_JS,
+                                {"query": location, "requirePrimary": False})
+            if res and res.get("status") == "clicked":
+                return res.get("text")
+        except Exception:
+            pass
+        return None
+
+    for attempt in range(1, 4):
+        try:
+            box.click()
+            box.fill("")
+            page.wait_for_timeout(300)
+            try:
+                box.press_sequentially(location, delay=70)
+            except Exception:
+                box.type(location, delay=70)
+        except Exception:
+            pass
+        page.wait_for_timeout(800)
+        clicked = select_best()
+        page.wait_for_timeout(1000)
+        good_city = (not primary) or (clicked and primary in clicked.lower())
+        if clicked and committed() and good_city:
+            log(f"  Location accepted: {clicked}")
+            return True
+        page.keyboard.press("ArrowDown")
+        page.wait_for_timeout(300)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(1200)
+        if committed() and ((not primary) or attempt >= 2):
+            log(f"  Location accepted: {clicked or location}")
+            return True
+        log(f"  Location not committed yet — retrying ({attempt}/3)")
+    return committed()
+
+
+def _click_show_cars(page):
+    for sel in [
+        "button:has-text('Show cars')", "button:has-text('SHOW CARS')",
+        "button:has-text('Show Cars')", "[data-testid='show-cars-button']",
+        "button:has-text('Show stations')", "button:has-text('SHOW STATIONS')",
+        "button:has-text('Show Stations')", "[data-testid*='show-stations']",
+        "[data-testid*='show-cars']", "form button[type='submit']",
+        "button[type='submit']",
+    ]:
+        try:
+            btn = page.locator(sel)
+            if btn.count() > 0 and btn.first.is_visible(timeout=1500):
+                btn.first.scroll_into_view_if_needed()
+                page.wait_for_timeout(200)
+                btn.first.click()
+                log(f"  Show cars -> {sel}")
+                return True
+        except Exception:
+            continue
+    try:
+        result = page.evaluate("""
+            () => {
+                for (const btn of Array.from(document.querySelectorAll('button'))) {
+                    const txt = btn.innerText.trim().toLowerCase();
+                    if (txt.includes('show') || txt.includes('car') || txt.includes('search')) {
+                        const bg = window.getComputedStyle(btn).backgroundColor;
+                        if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') {
+                            btn.click();
+                            return btn.innerText.trim();
+                        }
+                    }
+                }
+                return null;
+            }
+        """)
+        if result:
+            log(f"  Show cars JS -> '{result}'")
+            return True
+    except Exception:
+        pass
+    log("  WARNING: Show cars button not found")
+    return False
+
+
+def _is_branch_page(page):
+    try:
+        if "nearbybranches" in page.url.lower():
+            return True
+        body = page.inner_text("body")[:2500].lower()
+        return "select a pickup branch" in body or "pickup branch" in body
+    except Exception:
+        return False
+
+
+def _first_branch_name(page):
+    try:
+        return page.evaluate(r"""
+            () => {
+                const skip = /fully booked/i;
+                const lines = document.body.innerText.split('\n').map(l=>l.trim()).filter(Boolean);
+                let pastHeader = false;
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    if (/select a pickup branch/i.test(line)) { pastHeader=true; continue; }
+                    if (!pastHeader) continue;
+                    if (skip.test(line)) continue;
+                    if (/^(starting at|ca\$|keyboard|map data|help|log in)/i.test(line)) continue;
+                    if (line.length < 5 || line.length > 55) continue;
+                    const nxt = (lines[i+1]||'').toLowerCase();
+                    const nxt2= (lines[i+2]||'').toLowerCase();
+                    if (nxt.includes('starting at')||nxt2.includes('starting at')) return line;
+                }
+                return null;
+            }
+        """)
+    except Exception:
+        return None
+
+
+def _select_branch(page):
+    page.wait_for_timeout(1500)
+    branch_name = _first_branch_name(page)
+    if branch_name:
+        log(f"  First branch: {branch_name}")
+        try:
+            loc = page.get_by_text(branch_name, exact=True)
+            if loc.count() > 0:
+                loc.first.scroll_into_view_if_needed()
+                loc.first.click(timeout=5000)
+                page.wait_for_timeout(2000)
+                return True
+        except Exception:
+            pass
+    try:
+        picked = page.evaluate(r"""
+            () => {
+                const skip = /fully booked/i;
+                const rows = [];
+                for (const el of document.querySelectorAll('div,li,article,button,[role="button"]')) {
+                    const t = (el.innerText||'').trim();
+                    if (!t||t.length>400||t.length<15) continue;
+                    if (skip.test(t)) continue;
+                    if (!/starting at/i.test(t)&&!/CA\$[\d,.]+\s*\/\s*day/i.test(t)) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.left>480||r.width<100||r.top<80) continue;
+                    rows.push({el, top:r.top, t:t.split('\n')[0].slice(0,50)});
+                }
+                rows.sort((a,b)=>a.top-b.top);
+                if (rows.length) { rows[0].el.click(); return rows[0].t; }
+                return null;
+            }
+        """)
+        if picked:
+            log(f"  Branch row: {picked}")
+            page.wait_for_timeout(2000)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _click_show_offers(page):
+    try:
+        page.wait_for_function(r"""
+            () => Array.from(document.querySelectorAll('button, a, [role="button"]'))
+                .some(el => /show\s+offers?/i.test((el.innerText || '').trim()))
+        """, timeout=8000)
+    except Exception:
+        pass
+    page.wait_for_timeout(500)
+    for sel in ["button:has-text('Show offers')", "button:has-text('SHOW OFFERS')",
+                "a:has-text('Show offers')", "[data-testid*='show-offers']",
+                "button:has-text('Show cars')"]:
+        try:
+            btn = page.locator(sel)
+            for i in range(min(btn.count(), 3)):
+                item = btn.nth(i)
+                if item.is_visible(timeout=1500):
+                    item.scroll_into_view_if_needed()
+                    item.click(timeout=5000)
+                    log(f"  Show offers -> {sel}")
+                    page.wait_for_timeout(5000)
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _branch_to_offers(page):
+    if not _is_branch_page(page):
+        return False
+    log("Branch selection page detected")
+    for attempt in range(1, 4):
+        log(f"  Attempt {attempt}/3...")
+        _select_branch(page)
+        page.wait_for_timeout(1500)
+        if _click_show_offers(page):
+            try:
+                page.wait_for_function(
+                    r"""() => /which car do you want|CA\$[\d,.]+\/\s*day/i.test(document.body.innerText)""",
+                    timeout=15000,
+                )
+                log("  Car offers page loaded")
+            except Exception:
+                log("  Car offers wait timed out — continuing")
+            page.wait_for_timeout(3000)
+            return True
+        branch_name = _first_branch_name(page)
+        if branch_name:
+            try:
+                page.get_by_text(branch_name, exact=True).first.click(timeout=3000)
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+    log("  All Show offers attempts failed")
+    return False
+
+
+def scrape():
+    cars = []
+    rental_meta = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        page = browser.new_page(user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ))
+        try:
+            log("Navigating to https://www.sixt.ca ...")
+            page.goto("https://www.sixt.ca", wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(3000)
+
+            log("Dismissing cookie popup...")
+            _dismiss_popups(page)
+
+            log("Waiting for Sixt search form...")
+            _wait_for_sixt_search_form(page)
+
+            log(f"Searching for location: {LOCATION}")
+            if not _commit_location(page, LOCATION):
+                log("Location not accepted — aborting")
+                page.screenshot(path=os.path.join(OUTPUT_DIR, "location_error.png"))
+                return []
+
+            rental_meta = _accumulate_rental_metadata(
+                rental_meta, _read_sixt_rental_metadata(page))
+
+            log("Using Sixt's preloaded pickup/return dates (no calendar override)")
+
+            log("Clicking Show cars / Show stations...")
+            if not _click_show_cars(page):
+                log("Could not open car list — aborting")
+                page.screenshot(path=os.path.join(OUTPUT_DIR, "show_cars_error.png"))
+                return []
+
+            if _location_error_visible(page):
+                log("Sixt rejected location — retrying dropdown selection")
+                if not _commit_location(page, LOCATION):
+                    return []
+                if not _click_show_cars(page):
+                    return []
+
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=20000)
+            except Exception:
+                pass
+            page.wait_for_timeout(4000)
+
+            if _is_branch_page(page) or "station" in page.inner_text("body")[:1500].lower():
+                log("Choosing pickup branch...")
+                _branch_to_offers(page)
+
+            log("Scrolling to load all cars...")
+            last_h = page.evaluate("document.body.scrollHeight")
+            for i in range(15):
+                page.evaluate("window.scrollBy(0, 800)")
+                page.wait_for_timeout(800)
+                new_h = page.evaluate("document.body.scrollHeight")
+                if i > 5 and new_h == last_h:
+                    break
+                last_h = new_h
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(2000)
+            page.screenshot(path=os.path.join(OUTPUT_DIR, "results.png"))
+
+            page_text = page.inner_text("body")
+            with open(os.path.join(OUTPUT_DIR, "page_content.txt"), "w") as f:
+                f.write(page_text)
+            log(f"Page text: {len(page_text)} chars")
+
+            price_hits = len(re.findall(r"CA\$[\d,]+\.?\d*/day", page_text, re.IGNORECASE))
+            log(f"{price_hits} CA$/day patterns found")
+
+            log("Running Sixt parser...")
+            page_cars = _extract_sixt_cards(page_text)
+            log("Running DOM extractor...")
+            dom_cars = _extract_dom_sixt(page)
+
+            cars = _merge_sixt_by_price(dom_cars, page_cars)
+            log(f"Merged: {len(cars)} unique cars (by price)")
+
+            rental_meta = _accumulate_rental_metadata(
+                rental_meta, _read_sixt_rental_metadata(page))
+            rental_meta = _finalize_rental_metadata(rental_meta, site="sixt")
+            if rental_meta.get("pickup_date"):
+                log(f"Rental dates: {rental_meta.get('pickup_date')} {rental_meta.get('pickup_time', '')} -> "
+                    f"{rental_meta.get('return_date')} {rental_meta.get('return_time', '')}".rstrip())
+            cars = _stamp_rental_dates(cars, rental_meta)
+
+            cars = _sanity_filter(cars)
+            cars = _finalize_cars_with_ollama(cars, page_text, SITE_HINT)
+            cars = _sanity_filter(cars)
+            log(f"Final: {len(cars)} valid cars")
+
+        except Exception as e:
+            log(f"ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                page.screenshot(path=os.path.join(OUTPUT_DIR, "error.png"))
+            except Exception:
+                pass
+        finally:
+            browser.close()
+    return cars
+
+
+def save(cars):
+    if not cars:
+        log("No cars to save.")
+        return
+    stamp = now_mst().strftime("%Y%m%d_%H%M%S")
+    df = pd.DataFrame(cars)
+    extra_cols = [c for c in df.columns if c not in CSV_COLUMNS]
+    df = df[[c for c in CSV_COLUMNS if c in df.columns] + extra_cols]
+    csv_path  = os.path.join(OUTPUT_DIR, f"{stamp}.csv")
+    json_path = os.path.join(OUTPUT_DIR, f"{stamp}.json")
+    df.to_csv(csv_path, index=False)
+    with open(json_path, "w") as f:
+        json.dump(cars, f, indent=2, ensure_ascii=False)
+    sep = "=" * 58
+    print(f"\n{sep}")
+    print(f"  {len(cars)} vehicles  |  {now_mst().strftime('%Y-%m-%d %H:%M:%S MST')}")
+    print(f"  Location : {LOCATION}")
+    print(f"  CSV      : {csv_path}")
+    print(f"  JSON     : {json_path}")
+    print(f"{sep}")
+    print("\nFirst 5 results:")
+    for i, c in enumerate(cars[:5], 1):
+        print(f"  {i}. {c['car_name']} ({c['car_type']}) — {c['price_per_day']}")
+
+
+if __name__ == "__main__":
+    log(f"Starting Sixt scraper for: {LOCATION}")
+    log("Dates: using Sixt's preloaded search form values")
+    cars = scrape()
+    save(cars)
+'''
+
 
 def _save_script(site, location, folder, stamp):
     import textwrap  # Added to ensure the Sixt block formatting works
@@ -1437,6 +2700,8 @@ def _save_script(site, location, folder, stamp):
     return_date   = (now_mst() + timedelta(days=3)).strftime("%m/%d/%Y")
     pickup_iso    = (now_mst() + timedelta(days=1)).strftime("%Y-%m-%d")
     return_iso    = (now_mst() + timedelta(days=3)).strftime("%Y-%m-%d")
+
+    site_hint = "Sixt.ca" if "sixt" in site.lower() else "Enterprise.com"
 
     # ── shared boilerplate header ────────────────────────────────────────────
     HEADER = f'''\
@@ -1451,6 +2716,13 @@ def _save_script(site, location, folder, stamp):
 {'='*64}
 Run directly:
     python3 {stamp}.py
+
+Optional AI (Ollama — same prompts as run.py):
+    ollama serve && ollama pull qwen2.5:7b
+    python3 {stamp}.py
+    USE_OLLAMA=0 python3 {stamp}.py          # parsers only
+    AI_MODE=merge python3 {stamp}.py         # parser + Ollama merge
+    AI_MODE=first python3 {stamp}.py         # Ollama drives extraction
 """
 
 import os, re, json, logging
@@ -1458,16 +2730,22 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 from playwright.sync_api import sync_playwright, Page
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
-LOCATION     = "{safe_loc}"
-PICKUP_DATE  = "{pickup_date}"
-RETURN_DATE  = "{return_date}"
-HEADLESS     = False
-MST          = ZoneInfo("America/Edmonton")
+LOCATION        = "{safe_loc}"
+SITE_HINT       = "{site_hint}"
+PICKUP_DATE     = "{pickup_date}"
+RETURN_DATE     = "{return_date}"
+HEADLESS        = False
+USE_OLLAMA      = os.environ.get("USE_OLLAMA", "1") not in ("0", "", "false", "False")
+AI_MODE         = os.environ.get("AI_MODE", "hybrid").lower()
+OLLAMA_BASE     = os.environ.get("OLLAMA_BASE", "http://localhost:11434")
+EXTRACTOR_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
+MST             = ZoneInfo("America/Edmonton")
 
 def now_mst():
     return datetime.now(MST)
@@ -1483,6 +2761,11 @@ OUTPUT_DIR = os.path.join(
 )
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+CSV_COLUMNS = [
+    "pickup_date", "return_date", "pickup_time", "return_time",
+    "car_name", "car_type", "price_per_day", "transmission", "seats", "bags", "location",
+]
+
 PRICE_RE = re.compile(r"((?:CA)?\\s*\\$\\s*[\\d,]+\\.?\\d*\\s*/\\s*day)", re.IGNORECASE)
 NUM_RE   = re.compile(r"[\\d,]+\\.?\\d*")
 
@@ -1491,7 +2774,7 @@ ENTERPRISE_CARD_RE = re.compile(
     r"(?P<model>[^\\n]+? or similar)\\s*\\n+Automatic\\s*\\n+"
     r"(?P<seats>\\d+)\\s+People\\s*\\n+"
     r"(?P<bags>\\d+)\\s+Bags\\s*\\n+"
-    r"(?:[^\\n]*\\n){0,20}?"
+    r"(?:[^\\n]*\\n){{0,20}}?"
     r"(?P<per_day>\\$[\\d,]+\\.?\\d*)\\s*\\n+Per Day",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -1503,7 +2786,7 @@ FALSE_POS = {{"Automatic","Manual","Standard","Select","Filter","Sort","Price",
 
     # ── Enterprise body ──────────────────────────────────────────────────────
     if "enterprise" in site.lower():
-        body = HEADER + '''\
+        body = HEADER + _ollama_script_src() + '''\
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -1713,9 +2996,9 @@ def scrape():
             # 3. Type location
             log(f"Typing location: {LOCATION}")
             typed = False
-            for sel in ["input#geoLocation", "input[id*='location' i]",
-                        "input[placeholder*='city' i]", "input[placeholder*='airport' i]",
-                        "input[type='text']:visible"]:
+            for sel in ["input#pickupLocationTextBox", "input#geoLocation",
+                        "input[id*='location' i]", "input[placeholder*='city' i]",
+                        "input[placeholder*='airport' i]", "input[type='text']:visible"]:
                 try:
                     inp = page.locator(sel)
                     if inp.count() > 0 and inp.first.is_visible(timeout=3000):
@@ -1859,6 +3142,10 @@ def scrape():
             cars = _sanity_filter(cars)
             log(f"After sanity filter: {len(cars)} cars")
 
+            cars = _finalize_cars_with_ollama(cars, page_text, SITE_HINT)
+            cars = _sanity_filter(cars)
+            log(f"Final: {len(cars)} valid cars")
+
         except Exception as e:
             log(f"ERROR: {e}")
             import traceback; traceback.print_exc()
@@ -1877,6 +3164,8 @@ def save(cars):
         return
     stamp = now_mst().strftime("%Y%m%d_%H%M%S")
     df = pd.DataFrame(cars)
+    extra_cols = [c for c in df.columns if c not in CSV_COLUMNS]
+    df = df[[c for c in CSV_COLUMNS if c in df.columns] + extra_cols]
     csv_path  = os.path.join(OUTPUT_DIR, f"{stamp}.csv")
     json_path = os.path.join(OUTPUT_DIR, f"{stamp}.json")
     df.to_csv(csv_path, index=False)
@@ -1902,7 +3191,7 @@ if __name__ == "__main__":
 
     # ── Sixt body ────────────────────────────────────────────────────────────
     elif "sixt" in site.lower():
-        body = textwrap.dedent(f"""\
+        sixt_header = textwrap.dedent(f"""\
 #!/usr/bin/env python3
 \"\"\"
 {'='*64}
@@ -1914,6 +3203,11 @@ if __name__ == "__main__":
 {'='*64}
 Run directly:
     python3 {stamp}.py
+
+Optional AI (Ollama — same prompts as run.py):
+    ollama serve && ollama pull qwen2.5:7b
+    USE_OLLAMA=0 python3 {stamp}.py    # parsers only
+    AI_MODE=merge python3 {stamp}.py   # parser + Ollama merge
 \"\"\"
 
 import os, re, json, logging
@@ -1921,16 +3215,22 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 from playwright.sync_api import sync_playwright, Page
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
-LOCATION     = "{safe_loc}"
-PICKUP_TIME  = "10:00"
-RETURN_TIME  = "10:00"
-HEADLESS     = False
-MST          = ZoneInfo("America/Edmonton")
+LOCATION        = "{safe_loc}"
+SITE_HINT       = "{site_hint}"
+PICKUP_TIME     = "10:00"
+RETURN_TIME     = "10:00"
+HEADLESS        = False
+USE_OLLAMA      = os.environ.get("USE_OLLAMA", "1") not in ("0", "", "false", "False")
+AI_MODE         = os.environ.get("AI_MODE", "hybrid").lower()
+OLLAMA_BASE     = os.environ.get("OLLAMA_BASE", "http://localhost:11434")
+EXTRACTOR_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
+MST             = ZoneInfo("America/Edmonton")
 
 def now_mst():
     return datetime.now(MST)
@@ -1947,8 +3247,10 @@ OUTPUT_DIR = os.path.join(
 )
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-PICKUP_DT = now_mst() + timedelta(days=1)
-RETURN_DT = now_mst() + timedelta(days=3)
+CSV_COLUMNS = [
+    "pickup_date", "return_date", "pickup_time", "return_time",
+    "car_name", "car_type", "price_per_day", "transmission", "seats", "bags", "location",
+]
 
 # ── regex / constants ────────────────────────────────────────────────────────
 PRICE_RE = re.compile(r"((?:CA)?\\s*\\$\\s*[\\d,]+\\.?\\d*\\s*/\\s*day)", re.IGNORECASE)
@@ -1962,150 +3264,6 @@ SIXT_CLASS_LINE_RE = re.compile(
     r"^(ECONOMY|COMPACT|INTERMEDIATE|STANDARD|FULLSIZE|FULL-SIZE|PREMIUM|MINIVAN|LUXURY|VAN|SUV|CONVERTIBLE)"
     r"(\\s+ELITE)?\\s+\\(([^)]+)\\)\\s*$", re.IGNORECASE
 )
-
-_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-_NAV_NEXT_SELS = [
-    "button[aria-label='Move forward to switch to the next month.']",
-    "button[aria-label*='next month' i]",
-    "button[aria-label*='Next month' i]",
-    "button[aria-label*='Next' i]",
-    "[class*='DayPickerNavigation_rightButton']",
-    "[class*='DayPickerNavigation_button']:last-of-type",
-    "[class*='navNext']", "[class*='nav-next']", "[class*='next-month']",
-    "button[class*='next']",
-]
-_MONTH_HEADER_SELS = [
-    "[class*='CalendarMonth_caption'] strong",
-    "[class*='CalendarMonth_caption']",
-    "[class*='DayPicker-Caption']",
-    "[class*='month-title']",
-    "h2[class*='month']",
-    "div[class*='month'] strong",
-]
-
-# ── extraction helpers ───────────────────────────────────────────────────────
-
-def _normalise_price(raw):
-    p = re.sub(r"\\s*/\\s*", "/", re.sub(r"\\s+", "", raw))
-    if not p.upper().startswith("CA"):
-        p = "CA" + p
-    return p
-
-def _parse_seats_bags(lines):
-    seats = bags = None
-    stop = len(lines)
-    for j, w in enumerate(lines):
-        if w.lower().startswith("unlimited") or PRICE_RE.search(w):
-            stop = j
-            break
-    nums = []
-    for w in lines[:stop]:
-        sm = re.match(r"^(\\d+)\\s*(?:\\(\\d+\\+\\d+\\))?\\s*$", w)
-        if sm:
-            n = int(sm.group(1))
-            if 1 <= n <= 9:
-                nums.append(n)
-    if len(nums) >= 2:
-        seats, bags = nums[-2], nums[-1]
-    elif len(nums) == 1:
-        seats = nums[0]
-    return seats, bags
-
-def _extract_sixt_cards(page_text):
-    lines = [l.strip() for l in page_text.split("\\n") if l.strip()]
-    cars = []
-    for i, line in enumerate(lines):
-        price_m = PRICE_RE.search(line)
-        if not price_m:
-            continue
-        raw_price = _normalise_price(price_m.group(1))
-        num_m = NUM_RE.search(raw_price)
-        if not num_m:
-            continue
-        try:
-            val = float(num_m.group().replace(",", ""))
-        except ValueError:
-            continue
-        if not (10.0 <= val <= 5000.0):
-            continue
-        window = lines[max(0, i - 35):i]
-        car_name, car_type, transmission = "Unknown", "Unknown", "Automatic"
-        seats, bags = None, None
-        header_slice = window
-        for j, w in enumerate(window):
-            hm = SIXT_CLASS_LINE_RE.match(w)
-            if hm:
-                base_type = hm.group(1).replace("-", "").title()
-                if base_type.lower() == "fullsize":
-                    base_type = "Fullsize"
-                car_type = f"{{base_type}} Elite" if hm.group(2) else base_type
-                car_name = hm.group(3).strip()
-                header_slice = window[j:]
-        seats, bags = _parse_seats_bags(header_slice)
-        for w in reversed(window):
-            if re.search(r"\\b(automatic|manual)\\b", w, re.I):
-                tr = TRANS_RE.search(w)
-                if tr:
-                    transmission = tr.group(1).title()
-                break
-        if car_name == "Unknown":
-            continue
-        cars.append({{
-            "car_name": car_name, "car_type": car_type,
-            "price_per_day": raw_price, "transmission": transmission,
-            "seats": seats, "bags": bags, "location": LOCATION,
-        }})
-    seen, unique = set(), []
-    for c in cars:
-        key = (c["car_name"].lower(), c["price_per_day"].lower())
-        if key not in seen:
-            seen.add(key)
-            unique.append(c)
-    log(f"  [parser] {{len(unique)}} cars")
-    return unique
-
-def _extract_dom_sixt(page):
-    try:
-        chunks = page.evaluate(\"\"\"
-            () => {{
-                const out = [], seen = new Set();
-                const nodes = document.querySelectorAll(
-                    '[class*="offer"],[class*="vehicle"],[class*="car"],[data-testid*="offer"],article'
-                );
-                for (const el of nodes) {{
-                    const t = (el.innerText || '').trim();
-                    if (!t || t.length < 40 || t.length > 2500) continue;
-                    if (!/CA\\\\$[\\\\d,.]+\\\\s*\\/\\\\s*day/i.test(t)) continue;
-                    const key = t.slice(0, 120);
-                    if (seen.has(key)) continue;
-                    seen.add(key);
-                    out.push(t);
-                }}
-                return out;
-            }}
-        \"\"\")
-        merged = []
-        for chunk in chunks or []:
-            merged.extend(_extract_sixt_cards(chunk))
-        log(f"  [dom] {{len(merged)}} cars")
-        return merged
-    except Exception as e:
-        log(f"  [dom] failed: {{e}}")
-        return []
-
-def _sanity_filter(cars):
-    good = []
-    for c in cars:
-        m = NUM_RE.search(str(c.get("price_per_day", "")))
-        if not m:
-            continue
-        try:
-            val = float(m.group().replace(",", ""))
-        except ValueError:
-            continue
-        if 10.0 <= val <= 1500.0:
-            good.append(c)
-    return good
 
 # ── popup dismissers ─────────────────────────────────────────────────────────
 
@@ -2123,487 +3281,8 @@ def _dismiss_popups(page):
         except Exception:
             continue
 
-# ── calendar engine ──────────────────────────────────────────────────────────
-
-def _get_visible_month_texts(page):
-    for sel in _MONTH_HEADER_SELS:
-        try:
-            els = page.locator(sel).all()
-            texts = []
-            for el in els:
-                try:
-                    t = el.inner_text(timeout=400).strip()
-                    if t and any(m in t for m in _MONTHS):
-                        texts.append(t)
-                except Exception:
-                    pass
-            if texts:
-                return texts
-        except Exception:
-            continue
-    return []
-
-def _navigate_to_month(page, target_dt):
-    target_str = target_dt.strftime("%B %Y")
-    for _ in range(12):
-        if any(target_str in v for v in _get_visible_month_texts(page)):
-            return True
-        for sel in _NAV_NEXT_SELS:
-            try:
-                btn = page.locator(sel)
-                if btn.count() > 0 and btn.first.is_visible(timeout=800):
-                    btn.first.click()
-                    page.wait_for_timeout(500)
-                    break
-            except Exception:
-                continue
-    return False
-
-def _pick_calendar_date(page, target_dt):
-    iso_date   = target_dt.strftime("%Y-%m-%d")
-    month_full = target_dt.strftime("%B")
-    day_num    = str(target_dt.day)
-    day_padded = target_dt.strftime("%d")
-    year_str   = str(target_dt.year)
-    log(f"  [pick] {{iso_date}}")
-
-    _navigate_to_month(page, target_dt)
-    page.wait_for_timeout(300)
-
-    # S1: data-date
-    for attr_sel in [f"[data-date='{{iso_date}}']", f"td[data-date='{{iso_date}}']",
-                     f"div[data-date='{{iso_date}}']", f"button[data-date='{{iso_date}}']"]:
-        try:
-            el = page.locator(attr_sel)
-            if el.count() > 0 and el.first.is_visible(timeout=800):
-                if "disabled" not in (el.first.get_attribute("aria-disabled") or ""):
-                    el.first.click()
-                    log(f"  [S1] data-date")
-                    page.wait_for_timeout(700)
-                    return True
-        except Exception:
-            continue
-
-    # S2: aria-label exact
-    for label in [target_dt.strftime("%A, %B %-d, %Y"),
-                  f"{{month_full}} {{day_num}}, {{year_str}}", iso_date]:
-        for tag in ["td", "div", "button", "*"]:
-            try:
-                el = page.locator(f"{{tag}}[aria-label='{{label}}']")
-                if el.count() > 0 and el.first.is_visible(timeout=600):
-                    if "disabled" not in (el.first.get_attribute("aria-disabled") or ""):
-                        el.first.click()
-                        log(f"  [S2] aria-label")
-                        page.wait_for_timeout(700)
-                        return True
-            except Exception:
-                continue
-
-    # S3: aria-label partial
-    for partial in [f"{{month_full}} {{day_num}}, {{year_str}}", iso_date]:
-        for tag in ["td", "div", "button"]:
-            try:
-                els = page.locator(f"{{tag}}[aria-label*='{{partial}}']")
-                for i in range(els.count()):
-                    el = els.nth(i)
-                    if not el.is_visible(timeout=400): continue
-                    cls = el.get_attribute("class") or ""
-                    if "disabled" in cls.lower() or "blocked" in cls.lower(): continue
-                    el.click()
-                    log(f"  [S3] aria partial")
-                    page.wait_for_timeout(700)
-                    return True
-            except Exception:
-                continue
-
-    # S4: nuclear scan
-    log(f"  [S4] nuclear scan day={{day_num}} month={{month_full}}")
-    try:
-        for el in page.locator("td, [class*='CalendarDay'], div[role='button']").all():
-            try:
-                if not el.is_visible(timeout=300): continue
-                txt = el.inner_text(timeout=300).strip()
-                if txt not in (day_num, day_padded): continue
-                label_attr = el.get_attribute("aria-label") or ""
-                if label_attr and month_full not in label_attr: continue
-                cls = el.get_attribute("class") or ""
-                if "disabled" in cls.lower() or "blocked" in cls.lower(): continue
-                el.click()
-                log(f"  [S4] nuclear success")
-                page.wait_for_timeout(700)
-                return True
-            except Exception:
-                continue
-    except Exception as e:
-        log(f"  [S4] error: {{e}}")
-
-    log(f"  [FAIL] all strategies exhausted for {{iso_date}}")
-    return False
-
-def _open_date_field(page, field_type):
-    if field_type == "pickup":
-        sels = ["[data-testid='pickup-date']","[data-testid='pickupDate']",
-                "input#pickupDate","input[id*='pickup'][id*='date' i]",
-                "[class*='pickup-date']","[class*='pickupDate']",
-                "button[aria-label*='pickup' i]","input:visible >> nth=1"]
-        coord = (265, 305)
-    else:
-        sels = ["[data-testid='return-date']","[data-testid='returnDate']",
-                "input#returnDate","input[id*='return'][id*='date' i]",
-                "[class*='return-date']","[class*='returnDate']",
-                "button[aria-label*='return' i]","input:visible >> nth=2"]
-        coord = (710, 305)
-    for sel in sels:
-        try:
-            loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible(timeout=1200):
-                loc.first.click()
-                page.wait_for_timeout(1500)
-                if page.locator("td, [class*='CalendarDay']").count() > 10:
-                    log(f"  [{{field_type}}] calendar opened via {{sel}}")
-                    return True
-        except Exception:
-            continue
-    try:
-        page.mouse.click(*coord)
-        page.wait_for_timeout(1500)
-        if page.locator("td, [class*='CalendarDay']").count() > 10:
-            return True
-    except Exception:
-        pass
-    return False
-
-def _fill_time(page, field_type, time_str):
-    sels = (["select[id*='pickupTime']","select[id*='pickup-time']","select:visible >> nth=0"]
-            if field_type == "pickup" else
-            ["select[id*='returnTime']","select[id*='return-time']","select:visible >> nth=1"])
-    for sel in sels:
-        try:
-            el = page.locator(sel)
-            if el.count() > 0 and el.first.is_visible(timeout=1000):
-                tag = el.first.evaluate("el => el.tagName.toLowerCase()")
-                if tag == "select":
-                    try:
-                        el.first.select_option(label=time_str)
-                    except Exception:
-                        el.first.select_option(value=time_str)
-                else:
-                    el.first.fill(time_str)
-                page.wait_for_timeout(300)
-                return
-        except Exception:
-            continue
-
-# ── branch / offers helpers ──────────────────────────────────────────────────
-
-def _is_branch_page(page):
-    try:
-        if "nearbybranches" in page.url.lower():
-            return True
-        body = page.inner_text("body")[:2500].lower()
-        return "select a pickup branch" in body or "pickup branch" in body
-    except Exception:
-        return False
-
-def _first_branch_name(page):
-    try:
-        return page.evaluate(\"\"\"
-            () => {{
-                const skip = /fully booked/i;
-                const lines = document.body.innerText.split('\\\\n').map(l=>l.trim()).filter(Boolean);
-                let pastHeader = false;
-                for (let i = 0; i < lines.length; i++) {{
-                    const line = lines[i];
-                    if (/select a pickup branch/i.test(line)) {{ pastHeader=true; continue; }}
-                    if (!pastHeader) continue;
-                    if (skip.test(line)) continue;
-                    if (/^(starting at|ca\\\\$|keyboard|map data|help|log in)/i.test(line)) continue;
-                    if (line.length < 5 || line.length > 55) continue;
-                    const nxt = (lines[i+1]||'').toLowerCase();
-                    const nxt2= (lines[i+2]||'').toLowerCase();
-                    if (nxt.includes('starting at')||nxt2.includes('starting at')) return line;
-                }}
-                return null;
-            }}
-        \"\"\")
-    except Exception:
-        return None
-
-def _select_branch(page):
-    page.wait_for_timeout(1500)
-    branch_name = _first_branch_name(page)
-    if branch_name:
-        log(f"  First branch: {{branch_name}}")
-        try:
-            loc = page.get_by_text(branch_name, exact=True)
-            if loc.count() > 0:
-                loc.first.scroll_into_view_if_needed()
-                loc.first.click(timeout=5000)
-                page.wait_for_timeout(2000)
-                return True
-        except Exception:
-            pass
-    # fallback: click left-sidebar row with price
-    try:
-        picked = page.evaluate(\"\"\"
-            () => {{
-                const skip = /fully booked/i;
-                const rows = [];
-                for (const el of document.querySelectorAll('div,li,article,button,[role="button"]')) {{
-                    const t = (el.innerText||'').trim();
-                    if (!t||t.length>400||t.length<15) continue;
-                    if (skip.test(t)) continue;
-                    if (!/starting at/i.test(t)&&!/CA\\\\$[\\\\d,.]+\\\\s*\\/\\\\s*day/i.test(t)) continue;
-                    const r = el.getBoundingClientRect();
-                    if (r.left>480||r.width<100||r.top<80) continue;
-                    rows.push({{el, top:r.top, t:t.split('\\\\n')[0].slice(0,50)}});
-                }}
-                rows.sort((a,b)=>a.top-b.top);
-                if (rows.length) {{ rows[0].el.click(); return rows[0].t; }}
-                return null;
-            }}
-        \"\"\")
-        if picked:
-            log(f"  Branch row: {{picked}}")
-            page.wait_for_timeout(2000)
-            return True
-    except Exception:
-        pass
-    return False
-
-def _click_show_offers(page):
-    try:
-        page.wait_for_function(
-            "() => Array.from(document.querySelectorAll('button,a,[role=\"button\"]'))"
-            ".some(el => /show\\\\s+offers?/i.test((el.innerText||'').trim()))",
-            timeout=8000
-        )
-    except Exception:
-        pass
-    page.wait_for_timeout(500)
-    for sel in ["button:has-text('Show offers')","button:has-text('SHOW OFFERS')",
-                "a:has-text('Show offers')","[data-testid*='show-offers']",
-                "button:has-text('Show cars')"]:
-        try:
-            btn = page.locator(sel)
-            for i in range(min(btn.count(), 3)):
-                item = btn.nth(i)
-                if item.is_visible(timeout=1500):
-                    item.scroll_into_view_if_needed()
-                    item.click(timeout=5000)
-                    log(f"  Show offers -> {{sel}}")
-                    page.wait_for_timeout(5000)
-                    return True
-        except Exception:
-            continue
-    return False
-
-def _branch_to_offers(page):
-    if not _is_branch_page(page):
-        return False
-    log("Branch selection page detected")
-    for attempt in range(1, 4):
-        log(f"  Attempt {{attempt}}/3...")
-        _select_branch(page)
-        page.wait_for_timeout(1500)
-        if _click_show_offers(page):
-            try:
-                page.wait_for_function(
-                    "() => /which car do you want|CA\\\\$[\\\\d,.]+\\/\\\\s*day/i.test(document.body.innerText)",
-                    timeout=15000
-                )
-                log("  Car offers page loaded")
-            except Exception:
-                log("  Car offers wait timed out — continuing")
-            page.wait_for_timeout(3000)
-            return True
-        branch_name = _first_branch_name(page)
-        if branch_name:
-            try:
-                page.get_by_text(branch_name, exact=True).first.click(timeout=3000)
-                page.wait_for_timeout(1500)
-            except Exception:
-                pass
-    log("  All Show offers attempts failed")
-    return False
-
-# ── main scrape ──────────────────────────────────────────────────────────────
-
-def scrape():
-    cars = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=HEADLESS,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
-        page = browser.new_page(user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        ))
-        try:
-            log("Navigating to https://www.sixt.ca ...")
-            page.goto("https://www.sixt.ca", wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3000)
-
-            log("Dismissing cookie popup...")
-            _dismiss_popups(page)
-
-            log(f"Typing location: {{LOCATION}}")
-            typed = False
-            for sel in ['input[placeholder*="Airport" i]','input[placeholder*="city" i]',
-                        'input[placeholder*="location" i]','input[type="search"]']:
-                try:
-                    inp = page.locator(sel)
-                    if inp.count() > 0 and inp.first.is_visible(timeout=3000):
-                        inp.first.click()
-                        inp.first.fill("")
-                        page.wait_for_timeout(200)
-                        inp.first.fill(LOCATION)
-                        log(f"  Typed into: {{sel}}")
-                        typed = True
-                        break
-                except Exception:
-                    continue
-            if not typed:
-                page.locator("input:visible").first.fill(LOCATION)
-
-            page.wait_for_timeout(3000)
-
-            picked = False
-            for ac_sel in ["[data-testid*='suggestion']:first-child",
-                           "[class*='suggestion']:first-child",
-                           "[role='option']:first-child","li:first-child"]:
-                try:
-                    ac = page.locator(ac_sel)
-                    if ac.count() > 0 and ac.first.is_visible(timeout=1500):
-                        ac.first.click()
-                        picked = True
-                        break
-                except Exception:
-                    continue
-            if not picked:
-                page.keyboard.press("Enter")
-            page.wait_for_timeout(2000)
-
-            log(f"Opening pickup date ({{PICKUP_DT.strftime('%Y-%m-%d')}})...")
-            _open_date_field(page, "pickup")
-            page.wait_for_timeout(500)
-            _pick_calendar_date(page, PICKUP_DT)
-            page.wait_for_timeout(800)
-            _fill_time(page, "pickup", PICKUP_TIME)
-
-            log(f"Picking return date ({{RETURN_DT.strftime('%Y-%m-%d')}})...")
-            if page.locator("td, [class*='CalendarDay']").count() <= 10:
-                _open_date_field(page, "return")
-                page.wait_for_timeout(500)
-            _pick_calendar_date(page, RETURN_DT)
-            page.wait_for_timeout(800)
-            _fill_time(page, "return", RETURN_TIME)
-
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
-
-            log("Clicking Show cars / Show stations...")
-            for sel in ["button:has-text('Show cars')","button:has-text('SHOW CARS')",
-                        "[data-testid='show-cars-button']","button[type='submit']"]:
-                try:
-                    btn = page.locator(sel)
-                    if btn.count() > 0 and btn.first.is_visible(timeout=1500):
-                        btn.first.scroll_into_view_if_needed()
-                        btn.first.click()
-                        log(f"  Show cars -> {{sel}}")
-                        break
-                except Exception:
-                    continue
-
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=20000)
-            except Exception:
-                pass
-            page.wait_for_timeout(4000)
-
-            if _is_branch_page(page):
-                _branch_to_offers(page)
-
-            log("Scrolling to load all cars...")
-            last_h = page.evaluate("document.body.scrollHeight")
-            for i in range(15):
-                page.evaluate("window.scrollBy(0, 800)")
-                page.wait_for_timeout(800)
-                new_h = page.evaluate("document.body.scrollHeight")
-                if i > 5 and new_h == last_h:
-                    break
-                last_h = new_h
-            page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(2000)
-            page.screenshot(path=os.path.join(OUTPUT_DIR, "results.png"))
-
-            page_text = page.inner_text("body")
-            with open(os.path.join(OUTPUT_DIR, "page_content.txt"), "w") as f:
-                f.write(page_text)
-            log(f"Page text: {{len(page_text)}} chars")
-
-            price_hits = len(re.findall(r"CA\\$[\\d,]+\\.?\\d*/day", page_text, re.IGNORECASE))
-            log(f"{{price_hits}} CA$/day patterns found")
-
-            log("Running Sixt parser...")
-            cars = _extract_sixt_cards(page_text)
-            log("Running DOM extractor...")
-            dom_cars = _extract_dom_sixt(page)
-
-            seen = {{}}
-            for c in cars + dom_cars:
-                key = (c["car_name"].lower(), c["price_per_day"].lower())
-                if key not in seen:
-                    seen[key] = c
-            cars = list(seen.values())
-            log(f"Merged: {{len(cars)}} unique cars")
-            cars = _sanity_filter(cars)
-            log(f"Final: {{len(cars)}} valid cars")
-
-        except Exception as e:
-            log(f"ERROR: {{e}}")
-            import traceback; traceback.print_exc()
-            try:
-                page.screenshot(path=os.path.join(OUTPUT_DIR, "error.png"))
-            except Exception:
-                pass
-        finally:
-            browser.close()
-    return cars
-
-
-def save(cars):
-    if not cars:
-        log("No cars to save.")
-        return
-    stamp = now_mst().strftime("%Y%m%d_%H%M%S")
-    df = pd.DataFrame(cars)
-    csv_path  = os.path.join(OUTPUT_DIR, f"{{stamp}}.csv")
-    json_path = os.path.join(OUTPUT_DIR, f"{{stamp}}.json")
-    df.to_csv(csv_path, index=False)
-    with open(json_path, "w") as f:
-        json.dump(cars, f, indent=2, ensure_ascii=False)
-    SEP = "=" * 58
-    print(f"\\n{{SEP}}")
-    print(f"  {{len(cars)}} vehicles  |  {{now_mst().strftime('%Y-%m-%d %H:%M:%S MST')}}")
-    print(f"  Location : {{LOCATION}}")
-    print(f"  CSV      : {{csv_path}}")
-    print(f"  JSON     : {{json_path}}")
-    print(f"{{SEP}}")
-    print("\\nFirst 5 results:")
-    for i, c in enumerate(cars[:5], 1):
-        print(f"  {{i}}. {{c['car_name']}} ({{c['car_type']}}) — {{c['price_per_day']}}")
-
-
-if __name__ == "__main__":
-    log(f"Starting Sixt scraper for: {{LOCATION}}")
-    log(f"Pickup: {{PICKUP_DT.strftime('%Y-%m-%d')}}  Return: {{RETURN_DT.strftime('%Y-%m-%d')}}")
-    cars = scrape()
-    save(cars)
 """)
+        body = sixt_header + _SIXT_PARSER_SRC + _sixt_metadata_helpers_src() + _ollama_script_src() + _SIXT_SCRIPT_TAIL
 
     # ── Fallback ─────────────────────────────────────────────────────────────
     else:
@@ -3466,21 +4145,31 @@ def run_sixt(
             if AI_FIRST:
                 log("         Reading offers with Ollama (AI-first)")
                 cars = _ollama_strict_extract(page_text, search_term, "Sixt.ca")
+                parser_cars = _merge_sixt_by_price(
+                    _extract_dom_sixt(page, search_term),
+                    _extract_sixt_cards(page_text, search_term),
+                )
                 if AI_MERGE:
                     log("         AI-merge enabled — adding parser results")
-                    parser_cars = _merge_results(_extract_sixt_cards(page_text, search_term),
-                                                 _extract_dom_sixt(page, search_term))
                     log(f"         Parser found {len(parser_cars)} additional candidates")
                     cars = _merge_results(cars, parser_cars)
+                elif cars and parser_cars:
+                    log("         Backfilling transmission/seats/bags from parser")
+                    cars = _backfill_from_parser(cars, parser_cars)
+                    if len(cars) < len(parser_cars):
+                        log(f"         Ollama found {len(cars)}/{len(parser_cars)} — adding parser offers AI missed")
+                        cars = _merge_sixt_by_price(cars, parser_cars)
                 elif not cars:
                     log("         AI returned nothing — using the page parser")
-                    cars = _merge_results(_extract_sixt_cards(page_text, search_term),
-                                          _extract_dom_sixt(page, search_term))
+                    cars = parser_cars
             else:
                 sixt_cars = _extract_sixt_cards(page_text, search_term)
                 dom_sixt = _extract_dom_sixt(page, search_term)
-                cars = _merge_results(sixt_cars, dom_sixt)
+                cars = _merge_sixt_by_price(dom_sixt, sixt_cars)
 
+                if not cars:
+                    log("         Page parser found nothing — trying generic regex parser")
+                    cars = _regex_extract(page_text, search_term)
                 if not cars:
                     log("         Page parser found nothing — asking the AI to read it")
                     cars = _ollama_strict_extract(page_text, search_term, "Sixt.ca")
@@ -3775,20 +4464,22 @@ def run_enterprise(
             if AI_FIRST:
                 log("         Reading offers with Ollama (AI-first)")
                 cars = _ollama_strict_extract(page_text, display_name, site_hint="Enterprise.com")
+                parser_cars = _merge_results(
+                    _extract_enterprise_cards(page_text, display_name),
+                    _extract_dom_enterprise(page, display_name),
+                )
+                if not parser_cars:
+                    parser_cars = _regex_extract(page_text, display_name)
                 if AI_MERGE:
                     log("         AI-merge enabled — adding parser results")
-                    parser_cars = _merge_results(_extract_enterprise_cards(page_text, display_name),
-                                                 _extract_dom_enterprise(page, display_name))
-                    if not parser_cars:
-                        parser_cars = _regex_extract(page_text, display_name)
                     log(f"         Parser found {len(parser_cars)} additional candidates")
                     cars = _merge_results(cars, parser_cars)
+                elif cars and parser_cars:
+                    log("         Backfilling transmission/seats/bags from parser")
+                    cars = _backfill_from_parser(cars, parser_cars)
                 elif not cars:
                     log("         AI returned nothing — using the page parser")
-                    cars = _merge_results(_extract_enterprise_cards(page_text, display_name),
-                                          _extract_dom_enterprise(page, display_name))
-                    if not cars:
-                        cars = _regex_extract(page_text, display_name)
+                    cars = parser_cars
             else:
                 log("         Running Enterprise page parser")
                 ent_cars = _extract_enterprise_cards(page_text, display_name)
