@@ -4022,12 +4022,19 @@ def save_results(result: dict, output_base: str = "scraper_outputs") -> dict:
         f.write("\n".join(result.get("logs", [])))
     paths["logs"] = log_path
 
+    def _display_path(path: str) -> str:
+        """Relative path when possible so terminal ctrl+click opens the file."""
+        try:
+            return os.path.relpath(path)
+        except ValueError:
+            return path
+
     print(f"\n{'='*58}")
     print(f"  {result.get('count',0)} records  |  "
           f"{now_mst().strftime('%Y-%m-%d %H:%M:%S MST')}")
-    print(f"  {folder}")
+    print(f"  {_display_path(folder)}/")
     for kind, path in paths.items():
-        print(f"     {kind:<8} -> {os.path.basename(path)}")
+        print(f"     {kind:<8} -> {_display_path(path)}")
     print(f"{'='*58}\n")
 
     return paths
