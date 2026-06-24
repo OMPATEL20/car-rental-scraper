@@ -234,6 +234,20 @@ scraper_outputs/Enterprise_Car_Rental/Toronto_Airport/20260618_121242.csv
 
 **Open the `.csv` file in Excel or Google Sheets.**
 
+### Opening results in VS Code / Cursor
+
+Output files live in `scraper_outputs/`, which is **gitignored** (so your CSVs are not uploaded to GitHub). That is correct for sharing the project, but the editor may hide those files from search unless you configure it.
+
+This repo includes **`.vscode/settings.json`** so anyone who clones from GitHub can:
+
+- See `scraper_outputs/` in the file explorer
+- Use **Cmd+P** (Mac) or **Ctrl+P** (Windows) to search output files
+- **Cmd+click** (Mac) or **Ctrl+click** (Windows) the full path printed in the terminal after a run
+
+When the scraper finishes, it prints **absolute paths** to each file — click that path in the terminal to open the CSV.
+
+**If search still shows "No matching results":** open the folder in the sidebar (`scraper_outputs` → site → location) or double-click the `.csv` path from Finder / File Explorer.
+
 Each run creates 4 files:
 
 | File | What it is |
@@ -334,6 +348,12 @@ ollama serve
 
 ---
 
+### Can't open CSV from VS Code search or terminal
+
+Output is in `scraper_outputs/`, which is gitignored on purpose. Open the project folder in VS Code (not just a single file) so `.vscode/settings.json` applies. Then use the sidebar, **Cmd+P** / **Ctrl+P**, or **Cmd+click** the path printed when the scraper finishes.
+
+---
+
 ### 0 vehicles found
 
 Try a different mode:
@@ -353,7 +373,8 @@ Or run **without** `--headless` so you can see if a pop-up is blocking the page.
 | `agent_core.py` | No — the scraper engine |
 | `requirements.txt` | No — list of packages to install |
 | `README.md` | No — this guide |
-| `.gitignore` | No — for GitHub |
+| `.gitignore` | No — keeps outputs off GitHub |
+| `.vscode/settings.json` | No — makes output files easy to find in VS Code |
 
 ---
 
