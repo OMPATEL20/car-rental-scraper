@@ -51,22 +51,33 @@ CSV_COLUMNS = [
     "car_name", "car_type", "price_per_day", "transmission", "seats", "bags", "location",
 ]
 
+_INTERNAL_CAR_FIELDS = frozenset({"_source", "_confidence"})
+
+
+def _strip_internal_fields(cars: list[dict]) -> list[dict]:
+    return [{k: v for k, v in c.items() if k not in _INTERNAL_CAR_FIELDS} for c in cars]
+
+
+_TIME_HHMM_RE = re.compile(r"^\d{2}:\d{2}$")
+
 
 def _to_iso_date(date_str: str) -> str:
     """Normalize common date strings to YYYY-MM-DD."""
     raw = str(date_str or "").strip()
     if not raw:
         raise ValueError("empty date")
+    # Sixt widgets often show "25. Jun. 2026"
+    cleaned = re.sub(r"\s+", " ", raw.replace(".", " ").strip())
     for fmt in (
         "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d.%m.%Y",
         "%B %d, %Y", "%b %d, %Y", "%d %b %Y", "%d %B %Y",
     ):
         try:
-            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
     # "Jun 20" without year — assume current/next occurrence in MST
-    m = re.match(r"([A-Za-z]{3,9})\s+(\d{1,2})(?:,?\s*(\d{4}))?", raw)
+    m = re.match(r"([A-Za-z]{3,9})\s+(\d{1,2})(?:,?\s*(\d{4}))?", cleaned)
     if m:
         month_s, day_s, year_s = m.group(1), m.group(2), m.group(3)
         year = int(year_s) if year_s else now_mst().year
@@ -87,20 +98,22 @@ def _to_iso_date(date_str: str) -> str:
 
 
 def _normalize_time_str(time_str: str) -> str:
-    """Normalize to HH:MM (24h)."""
+    """Normalize to HH:MM (24h). Returns '' if the value is not a real time."""
     raw = str(time_str or "").strip()
     if not raw:
         return ""
-    raw = raw.upper().replace(".", ":")
-    m = re.match(r"(\d{1,2}):(\d{2})\s*(AM|PM)?", raw, re.I)
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)?\s*$", raw.upper(), re.I)
     if not m:
-        return raw[:5]
+        return ""
     hour, minute, ampm = int(m.group(1)), m.group(2), (m.group(3) or "").upper()
     if ampm == "PM" and hour < 12:
         hour += 12
     elif ampm == "AM" and hour == 12:
         hour = 0
-    return f"{hour:02d}:{minute}"
+    if not (0 <= hour <= 23):
+        return ""
+    result = f"{hour:02d}:{minute}"
+    return result if _TIME_HHMM_RE.match(result) else ""
 
 
 def _split_iso_datetime(val: str) -> tuple[str | None, str | None]:
@@ -135,7 +148,7 @@ def _parse_rental_field(val: str) -> tuple[str | None, str | None]:
     try:
         return _to_iso_date(raw), None
     except ValueError:
-        return None, _normalize_time_str(raw)
+        return None, None
 
 
 def _merge_rental_metadata(page_meta: dict, user_meta: dict) -> dict:
@@ -243,17 +256,18 @@ _SIXT_METADATA_JS = r"""
 
 def _normalize_sixt_metadata(raw: dict) -> dict:
     out: dict[str, str] = {}
+    # Date widgets -> dates only; time widgets -> times only (avoids "25: J" garbage)
     field_map = [
-        ("pickup_date_display", "pickup_date", "pickup_time"),
-        ("pickupDate", "pickup_date", "pickup_time"),
-        ("pickup_date", "pickup_date", "pickup_time"),
-        ("url_pickup", "pickup_date", "pickup_time"),
-        ("pickup_storage", "pickup_date", "pickup_time"),
-        ("return_date_display", "return_date", "return_time"),
-        ("returnDate", "return_date", "return_time"),
-        ("return_date", "return_date", "return_time"),
-        ("url_return", "return_date", "return_time"),
-        ("return_storage", "return_date", "return_time"),
+        ("pickup_date_display", "pickup_date", None),
+        ("pickupDate", "pickup_date", None),
+        ("pickup_date", "pickup_date", None),
+        ("url_pickup", "pickup_date", None),
+        ("pickup_storage", "pickup_date", None),
+        ("return_date_display", "return_date", None),
+        ("returnDate", "return_date", None),
+        ("return_date", "return_date", None),
+        ("url_return", "return_date", None),
+        ("return_storage", "return_date", None),
         ("pickup_time_display", None, "pickup_time"),
         ("return_time_display", None, "return_time"),
         ("pickup_time_storage", None, "pickup_time"),
@@ -266,7 +280,7 @@ def _normalize_sixt_metadata(raw: dict) -> dict:
         iso, tm = _parse_rental_field(val)
         if iso and date_key and date_key not in out:
             out[date_key] = iso
-        if tm and time_key and time_key not in out:
+        if tm and time_key and time_key not in out and _TIME_HHMM_RE.match(tm):
             out[time_key] = tm
     return out
 
@@ -806,7 +820,118 @@ def _enterprise_results_present(page: Page) -> bool:
         body = page.inner_text("body", timeout=1500)
     except Exception:
         return False
-    return "Per Day" in body or "Call For Availability" in body
+    return (
+        "Per Day" in body
+        or "Call For Availability" in body
+        or "Choose a Vehicle Class" in body
+    )
+
+
+def _enterprise_time_label(time_str: str) -> str:
+    """Enterprise dropdown labels use 12-hour clock, e.g. 10:00 AM."""
+    raw = str(time_str or "").strip()
+    if not raw:
+        return "10:00 AM"
+    m = re.match(r"(\d{1,2}):(\d{2})\s*(AM|PM)?", raw, re.I)
+    if not m:
+        return "10:00 AM"
+    hour, minute, ampm = int(m.group(1)), m.group(2), (m.group(3) or "").upper()
+    if ampm:
+        return f"{hour}:{minute} {ampm}"
+    if hour == 0:
+        return f"12:{minute} AM"
+    if hour < 12:
+        return f"{hour}:{minute} AM"
+    if hour == 12:
+        return f"12:{minute} PM"
+    return f"{hour - 12}:{minute} PM"
+
+
+def _enterprise_is_sold_out(page: Page) -> bool:
+    try:
+        body = page.inner_text("body", timeout=2000).lower()
+    except Exception:
+        return False
+    return "sold out" in body or "no vehicles available" in body
+
+
+_ENTERPRISE_TIME_PICK_JS = r"""
+({which, label}) => {
+  const want = (label || '').toLowerCase();
+  const isPickup = which === 'pickup';
+  const timeRe = /\d{1,2}\s*:\s*\d{2}\s*(am|pm)?/i;
+  const pickers = Array.from(document.querySelectorAll(
+    'button, [role="button"], [role="combobox"], select'
+  ));
+  const triggers = pickers.filter(el => {
+    const t = (el.innerText || el.value || '').replace(/\s+/g, ' ');
+    if (!timeRe.test(t)) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 20 && r.height > 10 && r.top > 80;
+  }).sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+  const trigger = isPickup ? triggers[0] : (triggers[1] || triggers[0]);
+  if (!trigger) return {status: 'no_trigger'};
+  trigger.scrollIntoView({block: 'center'});
+  trigger.click();
+  const opts = Array.from(document.querySelectorAll('li, button, [role="option"], option'));
+  for (const el of opts) {
+    const t = (el.innerText || el.value || '').trim().replace(/\s+/g, ' ');
+    const low = t.toLowerCase();
+    if (low !== want && !low.startsWith(want + ' ')) continue;
+    if (/closed/i.test(t)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 5 || r.height < 5) continue;
+    el.click();
+    return {status: 'ok', picked: t};
+  }
+  return {status: 'no_option'};
+}
+"""
+
+
+def _enterprise_confirm_times(
+    page: Page,
+    pickup_time: str = "10:00",
+    return_time: str = "10:00",
+    log_fn=None,
+) -> None:
+    """Location detail pages require explicit pick-up/return time selection."""
+    try:
+        body = page.inner_text("body", timeout=2000).lower()
+    except Exception:
+        return
+    if "please select a pick-up time" not in body and "please select a return time" not in body:
+        return
+    for which, label, name in (
+        ("pickup", _enterprise_time_label(pickup_time), "pickup"),
+        ("return", _enterprise_time_label(return_time), "return"),
+    ):
+        try:
+            res = page.evaluate(_ENTERPRISE_TIME_PICK_JS, {"which": which, "label": label})
+            if log_fn and res and res.get("status") == "ok":
+                log_fn(f"         {name} time -> {res.get('picked')}")
+            page.wait_for_timeout(600)
+        except Exception:
+            continue
+
+
+def _wait_for_enterprise_vehicle_results(page: Page, log_fn=None, timeout_ms: int = 30000) -> bool:
+    try:
+        page.wait_for_function(
+            "() => /choose a vehicle class|per day|or similar/i.test(document.body.innerText)",
+            timeout=timeout_ms,
+        )
+        if log_fn:
+            log_fn("         Vehicle results page loaded")
+        page.wait_for_timeout(1500)
+        return True
+    except Exception:
+        if _enterprise_is_sold_out(page):
+            if log_fn:
+                log_fn("         Sold out — no vehicles for these dates at this location")
+        elif log_fn:
+            log_fn("         Vehicle results page not detected")
+        return False
 
 
 def _scroll_enterprise_results(page: Page, max_scrolls: int = 8) -> None:
@@ -1391,6 +1516,9 @@ def _merge_record(existing: dict, incoming: dict) -> dict:
         elif field == "car_type":
             if out.get(field) in (None, "", "Unknown") and xval not in (None, "", "Unknown"):
                 out[field] = xval
+        elif field == "transmission":
+            if out.get(field) in (None, "", "Unknown") and xval not in (None, "", "Unknown"):
+                out[field] = xval
         elif field == "location":
             if not out.get(field) and xval:
                 out[field] = xval
@@ -1444,7 +1572,7 @@ def _merge_sixt_by_price(*sources) -> list[dict]:
 
 
 def _backfill_from_parser(ai_cars: list[dict], parser_cars: list[dict]) -> list[dict]:
-    """Keep AI row count; fill empty fields from parser matched by price."""
+    """Keep AI row count; fill empty fields from parser matched by price or car name."""
     if not ai_cars:
         return parser_cars
     if not parser_cars:
@@ -1454,14 +1582,29 @@ def _backfill_from_parser(ai_cars: list[dict], parser_cars: list[dict]) -> list[
         for c in parser_cars
         if _norm_price_key(c.get("price_per_day", ""))
     }
+    by_name: dict[str, dict] = {}
+    for c in parser_cars:
+        nk = _norm_name_key(c.get("car_name", ""))
+        if nk and nk not in by_name:
+            by_name[nk] = c
     for car in ai_cars:
         parser = by_price.get(_norm_price_key(car.get("price_per_day", "")))
+        if not parser:
+            parser = by_name.get(_norm_name_key(car.get("car_name", "")))
         if not parser:
             continue
         for field in ("seats", "bags", "transmission", "car_type", "car_name"):
             if car.get(field) in (None, "", "Unknown") and parser.get(field) not in (None, "", "Unknown"):
                 car[field] = parser[field]
     return ai_cars
+
+
+def _ensure_transmission(cars: list[dict], default: str = "Automatic") -> list[dict]:
+    """Sixt cards almost always show Automatic — never leave transmission blank in CSV."""
+    for car in cars:
+        if car.get("transmission") in (None, "", "Unknown"):
+            car["transmission"] = default
+    return cars
 
 
 def _sixt_text_for_ollama(page_text: str) -> str:
@@ -1602,6 +1745,8 @@ def _ollama_strict_extract(page_text, location, site_hint=""):
                 c["price_per_day"] = _normalise_price(str(c["price_per_day"]))
             if c.get("transmission"):
                 c["transmission"] = str(c["transmission"]).title()
+            else:
+                c["transmission"] = "Automatic"
             for field in ("seats", "bags"):
                 if c.get(field) is not None:
                     try:
@@ -1620,8 +1765,31 @@ def _ollama_strict_extract(page_text, location, site_hint=""):
 def _ollama_script_prompt_src() -> str:
     """Embed the same Ollama prompt helpers used by run.py into generated scripts."""
     import inspect
-    src = inspect.getsource(_ollama_extract_prompts) + "\n" + inspect.getsource(_ollama_strict_extract)
+    src = "\n".join(
+        inspect.getsource(fn)
+        for fn in (_sixt_text_for_ollama, _ollama_extract_prompts, _ollama_strict_extract)
+    )
     return src.replace("logger.info(", "log(").replace("logger.warning(", "log(")
+
+
+def _enterprise_nav_helpers_src() -> str:
+    """Enterprise wait/scroll/time helpers embedded in generated scripts."""
+    import inspect
+    js = _ENTERPRISE_TIME_PICK_JS.strip()
+    block = f'_ENTERPRISE_TIME_PICK_JS = r"""\n{js}\n"""\n\n'
+    for fn in (
+        _enterprise_time_label,
+        _enterprise_results_present,
+        _enterprise_is_sold_out,
+        _enterprise_confirm_times,
+        _wait_for_enterprise_vehicle_results,
+        _scroll_enterprise_results,
+    ):
+        src = inspect.getsource(fn)
+        # Generated scripts use log() not log_fn
+        src = re.sub(r"\blog_fn\b", "log", src)
+        block += src + "\n\n"
+    return block
 
 
 def _merge_results(*sources):
@@ -1760,6 +1928,13 @@ def _merge_cars_by_price(*sources):
     return list(by_price.values())
 
 
+def _ensure_transmission(cars, default="Automatic"):
+    for car in cars:
+        if car.get("transmission") in (None, "", "Unknown"):
+            car["transmission"] = default
+    return cars
+
+
 def _finalize_cars_with_ollama(cars, page_text, site_hint):
     """Apply Ollama using the same hybrid/merge/first modes as run.py."""
     if not _ollama_available():
@@ -1789,7 +1964,7 @@ def _finalize_cars_with_ollama(cars, page_text, site_hint):
             if len(ai_cars) < len(parser_cars):
                 log(f"  Ollama found {len(ai_cars)}/{len(parser_cars)} — adding parser offers AI missed")
                 ai_cars = _merge_cars_by_price(ai_cars, parser_cars)
-        return ai_cars or parser_cars
+        return _ensure_transmission(ai_cars or parser_cars)
 
     ai_cars = []
     if AI_MODE == "merge":
@@ -1799,7 +1974,7 @@ def _finalize_cars_with_ollama(cars, page_text, site_hint):
     if not cars:
         log("  Parser found nothing — asking Ollama to read the page...")
         ai_cars = ai_cars or _ollama_strict_extract(page_text, LOCATION, site_hint)
-        return ai_cars
+        return _ensure_transmission(ai_cars)
 
     if ai_cars:
         cars = _merge_cars_by_price(cars, ai_cars)
@@ -1812,7 +1987,7 @@ def _finalize_cars_with_ollama(cars, page_text, site_hint):
     if any(c.get("car_name") in (None, "", "Unknown") for c in cars):
         cars = _ollama_enrich(cars, page_text, LOCATION, site_hint)
 
-    return cars
+    return _ensure_transmission(cars)
 
 '''
 
@@ -2061,31 +2236,54 @@ def _sixt_metadata_helpers_src() -> str:
     js = _SIXT_METADATA_JS.strip()
     return f'''# ── rental date/time metadata (matches run.py) ─────────────────────────────
 
+_TIME_HHMM_RE = re.compile(r"^\\d{{2}}:\\d{{2}}$")
+
+
 def _normalize_time_str(time_str):
+    """Normalize to HH:MM (24h). Returns '' if the value is not a real time."""
     raw = str(time_str or "").strip()
     if not raw:
         return ""
-    raw = raw.upper().replace(".", ":")
-    m = re.match(r"(\\d{{1,2}}):(\\d{{2}})\\s*(AM|PM)?", raw, re.I)
+    m = re.match(r"^(\\d{{1,2}}):(\\d{{2}})\\s*(AM|PM)?\\s*$", raw.upper(), re.I)
     if not m:
-        return raw[:5]
+        return ""
     hour, minute, ampm = int(m.group(1)), m.group(2), (m.group(3) or "").upper()
     if ampm == "PM" and hour < 12:
         hour += 12
     elif ampm == "AM" and hour == 12:
         hour = 0
-    return f"{{hour:02d}}:{{minute}}"
+    if not (0 <= hour <= 23):
+        return ""
+    result = f"{{hour:02d}}:{{minute}}"
+    return result if _TIME_HHMM_RE.match(result) else ""
 
 
 def _to_iso_date(date_str):
     raw = str(date_str or "").strip()
     if not raw:
         raise ValueError("empty date")
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%B %d, %Y", "%b %d, %Y"):
+    # Sixt widgets often show "25. Jun. 2026" — strip dots before parsing
+    cleaned = re.sub(r"\\s+", " ", raw.replace(".", " ").strip())
+    for fmt in (
+        "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d.%m.%Y",
+        "%B %d, %Y", "%b %d, %Y", "%d %b %Y", "%d %B %Y",
+    ):
         try:
-            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
+    m = re.match(r"([A-Za-z]{{3,9}})\\s+(\\d{{1,2}})(?:,?\\s*(\\d{{4}}))?", cleaned)
+    if m:
+        month_s, day_s, year_s = m.group(1), m.group(2), m.group(3)
+        year = int(year_s) if year_s else now_mst().year
+        for fmt in ("%b %d %Y", "%B %d %Y"):
+            try:
+                dt = datetime.strptime(f"{{month_s}} {{day_s}} {{year}}", fmt)
+                if not year_s and dt.date() < now_mst().date():
+                    dt = dt.replace(year=year + 1)
+                return dt.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
     raise ValueError(f"unrecognized date: {{date_str!r}}")
 
 
@@ -2108,7 +2306,7 @@ def _parse_rental_field(val):
     try:
         return _to_iso_date(raw), None
     except ValueError:
-        return None, _normalize_time_str(raw)
+        return None, None
 
 
 _SIXT_METADATA_JS = r"""
@@ -2118,17 +2316,18 @@ _SIXT_METADATA_JS = r"""
 
 def _normalize_sixt_metadata(raw):
     out = {{}}
+    # Date widgets -> dates only; time widgets -> times only (avoids "25: J" garbage)
     field_map = [
-        ("pickup_date_display", "pickup_date", "pickup_time"),
-        ("pickupDate", "pickup_date", "pickup_time"),
-        ("pickup_date", "pickup_date", "pickup_time"),
-        ("url_pickup", "pickup_date", "pickup_time"),
-        ("pickup_storage", "pickup_date", "pickup_time"),
-        ("return_date_display", "return_date", "return_time"),
-        ("returnDate", "return_date", "return_time"),
-        ("return_date", "return_date", "return_time"),
-        ("url_return", "return_date", "return_time"),
-        ("return_storage", "return_date", "return_time"),
+        ("pickup_date_display", "pickup_date", None),
+        ("pickupDate", "pickup_date", None),
+        ("pickup_date", "pickup_date", None),
+        ("url_pickup", "pickup_date", None),
+        ("pickup_storage", "pickup_date", None),
+        ("return_date_display", "return_date", None),
+        ("returnDate", "return_date", None),
+        ("return_date", "return_date", None),
+        ("url_return", "return_date", None),
+        ("return_storage", "return_date", None),
         ("pickup_time_display", None, "pickup_time"),
         ("return_time_display", None, "return_time"),
         ("pickup_time_storage", None, "pickup_time"),
@@ -2141,7 +2340,7 @@ def _normalize_sixt_metadata(raw):
         iso, tm = _parse_rental_field(val)
         if iso and date_key and date_key not in out:
             out[date_key] = iso
-        if tm and time_key and time_key not in out:
+        if tm and time_key and time_key not in out and _TIME_HHMM_RE.match(tm):
             out[time_key] = tm
     return out
 
@@ -2662,10 +2861,10 @@ def save(cars):
     if not cars:
         log("No cars to save.")
         return
+    cars = [{k: v for k, v in c.items() if k not in ("_source", "_confidence")} for c in cars]
     stamp = now_mst().strftime("%Y%m%d_%H%M%S")
     df = pd.DataFrame(cars)
-    extra_cols = [c for c in df.columns if c not in CSV_COLUMNS]
-    df = df[[c for c in CSV_COLUMNS if c in df.columns] + extra_cols]
+    df = df[[c for c in CSV_COLUMNS if c in df.columns]]
     csv_path  = os.path.join(OUTPUT_DIR, f"{stamp}.csv")
     json_path = os.path.join(OUTPUT_DIR, f"{stamp}.json")
     df.to_csv(csv_path, index=False)
@@ -2786,7 +2985,7 @@ FALSE_POS = {{"Automatic","Manual","Standard","Select","Filter","Sort","Price",
 
     # ── Enterprise body ──────────────────────────────────────────────────────
     if "enterprise" in site.lower():
-        body = HEADER + _ollama_script_src() + '''\
+        body = HEADER + _ollama_script_src() + _enterprise_nav_helpers_src() + '''\
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -2997,7 +3196,8 @@ def scrape():
             log(f"Typing location: {LOCATION}")
             typed = False
             for sel in ["input#pickupLocationTextBox", "input#geoLocation",
-                        "input[id*='location' i]", "input[placeholder*='city' i]",
+                        "input[name='location-search']",
+                        "input[placeholder*='ZIP' i]", "input[placeholder*='city' i]",
                         "input[placeholder*='airport' i]", "input[type='text']:visible"]:
                 try:
                     inp = page.locator(sel)
@@ -3090,6 +3290,8 @@ def scrape():
 
             page.wait_for_timeout(2500)
 
+            _enterprise_confirm_times(page, "10:00", "10:00", log)
+
             # 6. Browse vehicles
             for sel in ["button:has-text('Reserve')", "button:has-text('Browse Vehicles')",
                         "button:has-text('Search')", "button[type='submit']"]:
@@ -3102,22 +3304,31 @@ def scrape():
                 except Exception:
                     continue
 
-            # 7. Wait for results
+            # 7. Wait for results (navigation may still be in flight)
             log("Waiting for results page...")
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=15000)
-            except Exception:
-                pass
-            page.wait_for_timeout(2500)
+            if not _wait_for_enterprise_vehicle_results(page, log):
+                log("  No vehicle results — check screenshot")
+                page.screenshot(path=os.path.join(OUTPUT_DIR, "no_results.png"))
+                return []
+
             page.screenshot(path=os.path.join(OUTPUT_DIR, "results.png"))
 
-            # 8. Scroll to trigger lazy-load
+            try:
+                alt = page.locator("text=/Explore Alternative|Hide [Aa]lternative/i").first
+                if alt.is_visible(timeout=1500):
+                    alt.scroll_into_view_if_needed()
+                    page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+            # 8. Scroll to trigger lazy-load (safe if navigation already settled)
             log("Scrolling to load all vehicles...")
-            for _ in range(12):
-                page.evaluate("window.scrollBy({top: 300, left: 0, behavior: 'smooth'})")
-                page.wait_for_timeout(700)
-            page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(1000)
+            _scroll_enterprise_results(page)
+            try:
+                page.evaluate("window.scrollTo({top: 0, left: 0, behavior: 'auto'})")
+            except Exception:
+                pass
+            page.wait_for_timeout(500)
 
             # 9. Extract
             page_text = _truncate_enterprise_listing(page.inner_text("body"))
@@ -3143,6 +3354,7 @@ def scrape():
             log(f"After sanity filter: {len(cars)} cars")
 
             cars = _finalize_cars_with_ollama(cars, page_text, SITE_HINT)
+            cars = _ensure_transmission(cars)
             cars = _sanity_filter(cars)
             log(f"Final: {len(cars)} valid cars")
 
@@ -3162,10 +3374,10 @@ def save(cars):
     if not cars:
         log("No cars to save.")
         return
+    cars = [{k: v for k, v in c.items() if k not in ("_source", "_confidence")} for c in cars]
     stamp = now_mst().strftime("%Y%m%d_%H%M%S")
     df = pd.DataFrame(cars)
-    extra_cols = [c for c in df.columns if c not in CSV_COLUMNS]
-    df = df[[c for c in CSV_COLUMNS if c in df.columns] + extra_cols]
+    df = df[[c for c in CSV_COLUMNS if c in df.columns]]
     csv_path  = os.path.join(OUTPUT_DIR, f"{stamp}.csv")
     json_path = os.path.join(OUTPUT_DIR, f"{stamp}.json")
     df.to_csv(csv_path, index=False)
@@ -4153,6 +4365,7 @@ def run_sixt(
                     log("         AI-merge enabled — adding parser results")
                     log(f"         Parser found {len(parser_cars)} additional candidates")
                     cars = _merge_results(cars, parser_cars)
+                    cars = _backfill_from_parser(cars, parser_cars)
                 elif cars and parser_cars:
                     log("         Backfilling transmission/seats/bags from parser")
                     cars = _backfill_from_parser(cars, parser_cars)
@@ -4177,6 +4390,7 @@ def run_sixt(
                     log("         Filling in a few missing names with the AI")
                     cars = _ollama_enrich(cars, page_text, search_term, site_hint="Sixt.ca")
 
+            cars = _ensure_transmission(cars)
             cars = _sanity_filter(cars)
             rental_meta = _accumulate_rental_metadata(rental_meta, _read_sixt_rental_metadata(page))
             rental_meta = _finalize_rental_metadata(rental_meta, user_meta, site="sixt")
@@ -4412,6 +4626,13 @@ def run_enterprise(
 
             page.wait_for_timeout(2500)
 
+            _enterprise_confirm_times(
+                page,
+                user_meta.get("pickup_time", "10:00") or "10:00",
+                user_meta.get("return_time", "10:00") or "10:00",
+                log,
+            )
+
             log("Step 5/6  Loading available vehicles")
             reserve_clicked = False
             for sel in ["button:has-text('Reserve')", "button:has-text('Browse Vehicles')",
@@ -4436,7 +4657,12 @@ def run_enterprise(
             except Exception:
                 pass
 
-            page.wait_for_timeout(2500)
+            if not _wait_for_enterprise_vehicle_results(page, log):
+                page.screenshot(path="/tmp/enterprise_no_results.png")
+                log("         Vehicle results page not ready — check /tmp/enterprise_no_results.png")
+                return []
+
+            page.wait_for_timeout(1000)
             page.screenshot(path="/tmp/enterprise_results.png")
 
             try:
@@ -4474,6 +4700,7 @@ def run_enterprise(
                     log("         AI-merge enabled — adding parser results")
                     log(f"         Parser found {len(parser_cars)} additional candidates")
                     cars = _merge_results(cars, parser_cars)
+                    cars = _backfill_from_parser(cars, parser_cars)
                 elif cars and parser_cars:
                     log("         Backfilling transmission/seats/bags from parser")
                     cars = _backfill_from_parser(cars, parser_cars)
@@ -4503,6 +4730,7 @@ def run_enterprise(
                     log("         Filling in a few missing names with the AI")
                     cars = _ollama_enrich(cars, page_text, display_name, site_hint="Enterprise.com")
 
+            cars = _ensure_transmission(cars)
             cars = _sanity_filter(cars)
             page_meta = _read_enterprise_rental_metadata(page)
             rental_meta = _merge_rental_metadata(search_dates, user_meta)
@@ -4692,14 +4920,14 @@ def save_results(result: dict, output_base: str = "scraper_outputs") -> dict:
     paths = {}
 
     if result.get("records"):
-        df = pd.DataFrame(result["records"])
-        extra_cols = [c for c in df.columns if c not in CSV_COLUMNS]
-        df = df[[c for c in CSV_COLUMNS if c in df.columns] + extra_cols]
+        records = _strip_internal_fields(result["records"])
+        df = pd.DataFrame(records)
+        df = df[[c for c in CSV_COLUMNS if c in df.columns]]
         csv_path = f"{base_p}.csv"
         json_path = f"{base_p}.json"
         df.to_csv(csv_path, index=False)
         with open(json_path, "w") as f:
-            json.dump(result["records"], f, indent=2, ensure_ascii=False)
+            json.dump(records, f, indent=2, ensure_ascii=False)
         paths["csv"] = csv_path
         paths["json"] = json_path
     else:
@@ -4714,18 +4942,16 @@ def save_results(result: dict, output_base: str = "scraper_outputs") -> dict:
     paths["logs"] = log_path
 
     def _display_path(path: str) -> str:
-        """Relative path when possible so terminal ctrl+click opens the file."""
-        try:
-            return os.path.relpath(path)
-        except ValueError:
-            return path
+        """Absolute path so terminal cmd+click opens the file reliably."""
+        return os.path.abspath(path)
 
     print(f"\n{'='*58}")
     print(f"  {result.get('count',0)} records  |  "
           f"{now_mst().strftime('%Y-%m-%d %H:%M:%S MST')}")
     print(f"  {_display_path(folder)}/")
     for kind, path in paths.items():
-        print(f"     {kind:<8} -> {_display_path(path)}")
+        # Path first so VS Code/Cursor terminal link detection picks it up reliably.
+        print(f"  {_display_path(path)}  ({kind})")
     print(f"{'='*58}\n")
 
     return paths
