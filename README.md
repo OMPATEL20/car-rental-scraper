@@ -234,7 +234,7 @@ scraper_outputs/Enterprise_Car_Rental/Toronto_Airport/20260618_121242.csv
 
 **Open the `.csv` file in Excel or Google Sheets.**
 
-### Opening results in VS Code / Cursor
+### Opening results in VS Code
 
 Output files live in `scraper_outputs/`, which is **gitignored** (so your CSVs are not uploaded to GitHub). That is correct for sharing the project, but the editor may hide those files from search unless you configure it.
 
