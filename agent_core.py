@@ -4950,7 +4950,7 @@ def save_results(result: dict, output_base: str = "scraper_outputs") -> dict:
           f"{now_mst().strftime('%Y-%m-%d %H:%M:%S MST')}")
     print(f"  {_display_path(folder)}/")
     for kind, path in paths.items():
-        # Path first so VS Code/Cursor terminal link detection picks it up reliably.
+        # Path first so VS Code terminal link detection picks it up reliably.
         print(f"  {_display_path(path)}  ({kind})")
     print(f"{'='*58}\n")
 
